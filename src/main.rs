@@ -1,3 +1,8 @@
+use std::path::PathBuf;
+
+use dav_server::{fakels::FakeLs, localfs::LocalFs, DavHandler};
+use esp_idf_svc::{eventloop::EspSystemEventLoop, hal::task::block_on, http::server::EspHttpServer, nvs::EspDefaultNvsPartition, wifi::{self, AccessPointConfiguration, AuthMethod, BlockingWifi, EspWifi}};
+
 fn main() -> anyhow::Result<()> {
     use std::fs::{read_dir, File};
     use std::io::{Read, Seek, Write};
@@ -46,49 +51,47 @@ fn main() -> anyhow::Result<()> {
             None::<gpio::AnyIOPin>,
             &SdMmcHostConfiguration::new(),
         )?,
-        &SdCardConfiguration::new(),
+        &{
+
+            let mut config = SdCardConfiguration::new();
+            config.speed_khz = 40000;
+            config
+        },
     )?;
 
     // Keep it around or else it will be dropped and unmounted
     let _mounted_fatfs = MountedFatfs::mount(Fatfs::new_sdcard(0, sd_card_driver)?, "/sdcard", 4)?;
 
-    let content = b"Hello, world!";
+    info!("SD card mounted at /sdcard");
 
-    {
-        let mut file = File::create("/sdcard/test.txt")?;
+    // ============== Setup WiFi AP =================
+    let sys_loop = EspSystemEventLoop::take()?;
+    let nvs = EspDefaultNvsPartition::take()?;
+    let mut wifi = BlockingWifi::wrap(EspWifi::new(peripherals.modem, sys_loop.clone(), Some(nvs))?, sys_loop)?;
 
-        info!("File {file:?} created");
+    let ap_config = AccessPointConfiguration {
+        ssid: "ESP32-WEB-DAV".try_into().unwrap(),
+        password: "12345678".try_into().unwrap(),
+        auth_method: AuthMethod::WPA2Personal,
+        channel: 6,
+        ..Default::default()
+    };
 
-        file.write_all(content).expect("Write failed");
+    wifi.set_configuration(&wifi::Configuration::AccessPoint(ap_config))?;
+    wifi.start()?;
+    wifi.connect()?;
 
-        info!("File {file:?} written with {content:?}");
+    info!("WiFi Access Point started, SSID: ESP32-WEB-DAV");
 
-        file.seek(std::io::SeekFrom::Start(0)).expect("Seek failed");
+    // ============== Start WebDAV Server =================
 
-        info!("File {file:?} seeked");
-    }
+    let dav_server = DavHandler::builder()
+    .filesystem(LocalFs::new(PathBuf::from("/sdcard"), false, false, false))
+    .locksystem(FakeLs::new())
+    .build_handler();
 
-    {
-        let mut file = File::open("/sdcard/test.txt")?;
-
-        info!("File {file:?} opened");
-
-        let mut file_content = String::new();
-
-        file.read_to_string(&mut file_content).expect("Read failed");
-
-        info!("File {file:?} read: {file_content}");
-
-        assert_eq!(file_content.as_bytes(), content);
-    }
-
-    {
-        let directory = read_dir("/sdcard")?;
-
-        for entry in directory {
-            log::info!("Entry: {:?}", entry?.file_name());
-        }
-    }
-
+    
+    block_on(async {
+    });
     Ok(())
 }
