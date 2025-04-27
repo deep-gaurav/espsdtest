@@ -1,9 +1,18 @@
-use std::path::PathBuf;
+use std::{convert::Infallible, net::{Ipv4Addr, SocketAddr}, path::PathBuf};
 
 use dav_server::{fakels::FakeLs, localfs::LocalFs, DavHandler};
-use esp_idf_svc::{eventloop::EspSystemEventLoop, hal::task::block_on, http::server::EspHttpServer, nvs::EspDefaultNvsPartition, wifi::{self, AccessPointConfiguration, AuthMethod, BlockingWifi, EspWifi}};
+use esp_idf_svc::{
+    eventloop::EspSystemEventLoop,
+    hal::task::block_on,
+    http::server::EspHttpServer,
+    nvs::EspDefaultNvsPartition,
+    wifi::{self, AccessPointConfiguration, AuthMethod, BlockingWifi, EspWifi},
+};
+use hyper::{server::conn::http1, service::service_fn};
+use tokio::net::TcpListener;
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> anyhow::Result<()> {
     use std::fs::{read_dir, File};
     use std::io::{Read, Seek, Write};
 
@@ -52,7 +61,6 @@ fn main() -> anyhow::Result<()> {
             &SdMmcHostConfiguration::new(),
         )?,
         &{
-
             let mut config = SdCardConfiguration::new();
             config.speed_khz = 40000;
             config
@@ -67,7 +75,10 @@ fn main() -> anyhow::Result<()> {
     // ============== Setup WiFi AP =================
     let sys_loop = EspSystemEventLoop::take()?;
     let nvs = EspDefaultNvsPartition::take()?;
-    let mut wifi = BlockingWifi::wrap(EspWifi::new(peripherals.modem, sys_loop.clone(), Some(nvs))?, sys_loop)?;
+    let mut wifi = BlockingWifi::wrap(
+        EspWifi::new(peripherals.modem, sys_loop.clone(), Some(nvs))?,
+        sys_loop,
+    )?;
 
     let ap_config = AccessPointConfiguration {
         ssid: "ESP32-WEB-DAV".try_into().unwrap(),
@@ -86,12 +97,41 @@ fn main() -> anyhow::Result<()> {
     // ============== Start WebDAV Server =================
 
     let dav_server = DavHandler::builder()
-    .filesystem(LocalFs::new(PathBuf::from("/sdcard"), false, false, false))
-    .locksystem(FakeLs::new())
-    .build_handler();
+        .filesystem(LocalFs::new(PathBuf::from("/sdcard"), false, false, false))
+        .locksystem(FakeLs::new())
+        .build_handler();
 
-    
-    block_on(async {
-    });
+    // Create Hyper server
+    let addr = SocketAddr::from((Ipv4Addr::new(0, 0, 0, 0), 80));
+    let listener = TcpListener::bind(addr).await.unwrap();
+    loop {
+        let (stream, _) = listener.accept().await.unwrap();
+        let dav_server = dav_server.clone();
+
+        // Use an adapter to access something implementing `tokio::io` traits as if they implement
+        // `hyper::rt` IO traits.
+        let io = hyper_util::rt::TokioIo::new(stream);
+
+        // Spawn a tokio task to serve multiple connections concurrently
+        tokio::task::spawn(async move {
+            // Finally, we bind the incoming connection to our `hello` service
+            if let Err(err) = http1::Builder::new()
+                // `service_fn` converts our function in a `Service`
+                .serve_connection(
+                    io,
+                    service_fn({
+                        move |req| {
+                            let dav_server = dav_server.clone();
+                            async move { Ok::<_, Infallible>(dav_server.handle(req).await) }
+                        }
+                    }),
+                )
+                .await
+            {
+                eprintln!("Failed serving: {err:?}");
+            }
+        });
+    }
+
     Ok(())
 }

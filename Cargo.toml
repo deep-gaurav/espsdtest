@@ -12,6 +12,10 @@ harness = false # do not use the built in cargo test harness -> resolve rust-ana
 
 [profile.release]
 opt-level = "s"
+lto = true      # Link Time Optimization
+codegen-units = 1 # better optimization across units
+panic = "abort" # don't include panic formatting
+strip = true    # strip symbols
 
 [profile.dev]
 debug = true    # Symbols are nice and they don't increase the size on Flash
@@ -30,6 +34,9 @@ dav-server = "0.8.0"
 # http = "1.3.1"
 # smol = "2.0.2"
 # async-executor = "1"
+hyper = { version = "1.6.0", features = ["server", "http1"] }
+tokio = { version = "1", features = ["rt", "macros"] }
+hyper-util ={ version = "0.1.11", features = ["tokio"]}
 
 [build-dependencies]
 embuild = "0.33"
