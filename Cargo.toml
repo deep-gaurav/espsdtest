@@ -40,3 +40,6 @@ anyhow = "1.0.98"
 
 [build-dependencies]
 embuild = "0.33"
+
+[package.metadata.esp-flash]
+partition_table = "partitions.csv"
