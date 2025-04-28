@@ -15,6 +15,8 @@ use crate::{
     config::{AppConfig, MAX_UPLOAD_SIZE, SERVER_PORT},
     storage::get_content_type,
 };
+use std::sync::mpsc::{sync_channel, SyncSender, Receiver};
+
 
 // We need to make sure our struct is Send + Sync
 pub struct AppResources<'a> {
@@ -32,32 +34,30 @@ pub struct AppResources<'a> {
 // Allow resources to be sent across threads
 unsafe impl<'a> Send for AppResources<'a> {}
 unsafe impl<'a> Sync for AppResources<'a> {}
-const STACK_SIZE: usize = 1024*138;
+const STACK_SIZE: usize = 1024 * 138;
 
 pub fn setup_http_server() -> anyhow::Result<EspHttpServer<'static>> {
-    let mut server_config = Configuration{
-        stack_size:STACK_SIZE,
+    let mut server_config = Configuration {
+        stack_size: STACK_SIZE,
         ..Default::default()
     };
     server_config.uri_match_wildcard = true;
     server_config.http_port = SERVER_PORT;
-    
+
     Ok(EspHttpServer::new(&server_config)?)
 }
 
-pub fn register_handlers(
-    resources: Arc<Mutex<AppResources<'static>>>,
-) -> anyhow::Result<()> {
+pub fn register_handlers(resources: Arc<Mutex<AppResources<'static>>>) -> anyhow::Result<()> {
     // Extract what we need outside the handlers to avoid pointer issues
     let config = {
-        let locked_resources = resources.lock().map_err(|e|anyhow::anyhow!("{e:?}"))?;
+        let locked_resources = resources.lock().map_err(|e| anyhow::anyhow!("{e:?}"))?;
         locked_resources.config.clone()
     };
-    
+
     // Store the root path in an Arc to make it thread-safe
     let root_path = Arc::new(config.root_path);
     let chunk_size = config.chunk_size;
-    
+
     if let Ok(mut locked_resources) = resources.lock() {
         // Handler for GET requests - Directory listing and file download
         let get_root_path = root_path.clone();
@@ -66,7 +66,7 @@ pub fn register_handlers(
             .fn_handler("/*", esp_idf_svc::http::Method::Get, move |req| {
                 handle_get_request(req, get_root_path.clone(), chunk_size)
             })?;
-        
+
         // Handler for POST requests - File upload
         let post_root_path = root_path.clone();
         locked_resources
@@ -75,7 +75,7 @@ pub fn register_handlers(
                 handle_post_request(req, post_root_path.clone())
             })?;
     }
-    
+
     Ok(())
 }
 
@@ -99,37 +99,40 @@ fn handle_get_request(
     if full_path.is_dir() {
         // Simple directory listing
         let mut content = String::from("<!DOCTYPE html><html><head><title>Directory Listing</title></head><body><h1>Directory Listing</h1><ul>");
-        
+
         // Add parent directory link if not at root
         if path != "/" {
             let path = PathBuf::from(path);
             let parent_path = path.parent().unwrap_or_else(|| std::path::Path::new("/"));
-            content.push_str(&format!("<li><a href=\"{}\">.. (Parent Directory)</a></li>", parent_path.display()));
+            content.push_str(&format!(
+                "<li><a href=\"{}\">.. (Parent Directory)</a></li>",
+                parent_path.display()
+            ));
         }
-        
+
         if let Ok(entries) = fs::read_dir(&full_path) {
             let mut dirs = Vec::new();
             let mut files = Vec::new();
-            
+
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
                 let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
                 let entry_path = format!("{}/{}", path.trim_end_matches('/'), name);
-                
+
                 if is_dir {
                     dirs.push(format!("<li><a href=\"{}\">{}/</a></li>", entry_path, name));
                 } else {
                     files.push(format!("<li><a href=\"{}\">{}</a></li>", entry_path, name));
                 }
             }
-            
+
             // Sort and append directories first, then files
             dirs.sort();
             files.sort();
             content.push_str(&dirs.join(""));
             content.push_str(&files.join(""));
         }
-        
+
         content.push_str("</ul><hr><p>ESP32 WebDAV Server</p></body></html>");
 
         if let Ok(mut resp) = req.into_response(200, Some("OK"), &[("Content-Type", "text/html")]) {
@@ -143,23 +146,30 @@ fn handle_get_request(
             Ok(mut file) => {
                 let content_type = get_content_type(&full_path);
                 let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
-                
+
                 // Get range header if present
                 let range_header = req.header("Range").unwrap_or("").to_string();
-                
+
                 if range_header.starts_with("bytes=") {
                     // Handle range request
-                    handle_range_request(req, &mut file, file_size, content_type, &range_header, chunk_size)?;
+                    handle_range_request(
+                        req,
+                        &mut file,
+                        file_size,
+                        content_type,
+                        &range_header,
+                        chunk_size,
+                    )?;
                 } else {
                     // Handle full file request with chunking
                     if let Ok(mut resp) = req.into_response(
-                        200, 
+                        200,
                         Some("OK"),
                         &[
                             ("Content-Length", &format!("{file_size}")),
                             ("Content-Type", content_type),
                             ("Accept-Ranges", "bytes"),
-                        ]
+                        ],
                     ) {
                         let mut buffer = vec![0; chunk_size];
                         loop {
@@ -214,10 +224,10 @@ fn handle_range_request(
     } else {
         (0, file_size - 1)
     };
-    
+
     let content_length = end - start + 1;
     let content_range = format!("bytes {}-{}/{}", start, end, file_size);
-    
+
     // Seek to the requested position
     if let Err(e) = file.seek(std::io::SeekFrom::Start(start)) {
         log::error!("Error seeking file: {}", e);
@@ -228,21 +238,21 @@ fn handle_range_request(
         }
         return Ok(());
     }
-    
+
     // Send partial content
     if let Ok(mut resp) = req.into_response(
-        206, 
+        206,
         Some("Partial Content"),
         &[
             ("Content-Length", &format!("{content_length}")),
             ("Content-Type", content_type),
             ("Content-Range", &content_range),
             ("Accept-Ranges", "bytes"),
-        ]
+        ],
     ) {
         let mut bytes_remaining = content_length;
         let mut buffer = vec![0; std::cmp::min(chunk_size, bytes_remaining as usize)];
-        
+
         while bytes_remaining > 0 {
             let to_read = std::cmp::min(buffer.len(), bytes_remaining as usize);
             match file.read(&mut buffer[..to_read]) {
@@ -264,7 +274,7 @@ fn handle_range_request(
         }
         resp.release();
     }
-    
+
     Ok(())
 }
 
@@ -275,7 +285,7 @@ fn handle_post_request(
     log::info!("Received request for post");
     let path = req.uri().to_string();
     let full_path = root_path.join(path.trim_start_matches('/'));
-    
+
     log::info!("File path: {:?}", full_path);
     // Create parent directories if they don't exist
     if let Some(parent) = full_path.parent() {
@@ -291,7 +301,7 @@ fn handle_post_request(
             }
         }
     }
-    
+
     // Check if we're trying to upload to a directory path
     if full_path.exists() && full_path.is_dir() {
         if let Ok(mut resp) = req.into_status_response(400) {
@@ -301,11 +311,11 @@ fn handle_post_request(
         }
         return Ok(());
     }
-    
+
     // Get content length if available
     let content_length_str = req.header("Content-Length").unwrap_or("0");
     let content_length = content_length_str.parse::<usize>().unwrap_or(0);
-    
+
     // Check if the upload is too large
     if content_length as u64 > MAX_UPLOAD_SIZE {
         if let Ok(mut resp) = req.into_status_response(413) {
@@ -316,27 +326,47 @@ fn handle_post_request(
         return Ok(());
     }
 
-    log::info!("Create file {:?}",full_path);
-    
+    log::info!("Create file {:?}", full_path);
+
     // Create or open file for writing
     match File::create(&full_path) {
         Ok(mut file) => {
-            let mut buffer = vec![0; 1024*128]; // 4KB buffer for reading chunks
+            let mut buffer = vec![0; 1024 * 128]; // 4KB buffer for reading chunks
             let mut total_bytes = 0;
-            
+
+            let full_path_clone = full_path.clone();
+            let (tx, rx): (SyncSender<Vec<u8>>, Receiver<Vec<u8>>) = sync_channel(4); // 4 buffers
+            std::thread::spawn(move || {
+                if let Ok(mut file) = File::create(full_path_clone) {
+                    while let Ok(buffer) = rx.recv() {
+                        if let Err(e) = file.write_all(&buffer) {
+                            log::error!("Error writing to file: {}", e);
+                            break;
+                        }
+                    }
+                    if let Err(e) = file.flush() {
+                        log::error!("Error flushing file: {}", e);
+                    }
+                }
+            });
+
             // Read request body in chunks
             loop {
                 match req.read(&mut buffer) {
                     Ok(0) => break, // End of request
                     Ok(bytes_read) => {
-                        if let Err(e) = file.write_all(&buffer[..bytes_read]) {
-                            log::error!("Error writing to file: {}", e);
-                            if let Ok(mut resp) = req.into_status_response(500) {
-                                resp.write(b"Error writing file to storage")?;
-                                resp.flush()?;
-                                resp.release();
-                            }
-                            return Ok(());
+                        // if let Err(e) = file.write_all(&buffer[..bytes_read]) {
+                        //     log::error!("Error writing to file: {}", e);
+                        //     if let Ok(mut resp) = req.into_status_response(500) {
+                        //         resp.write(b"Error writing file to storage")?;
+                        //         resp.flush()?;
+                        //         resp.release();
+                        //     }
+                        //     return Ok(());
+                        // }
+                        if tx.send(buffer[..bytes_read].to_vec()).is_err() {
+                            log::error!("Writer thread died");
+                            break;
                         }
                         total_bytes += bytes_read;
                     }
@@ -346,15 +376,22 @@ fn handle_post_request(
                     }
                 }
             }
-            
+            drop(tx);
+
             if let Err(e) = file.flush() {
                 log::error!("Error flushing file: {}", e);
             }
-            
-            log::info!("File uploaded successfully: {} ({} bytes)", full_path.display(), total_bytes);
-            
+
+            log::info!(
+                "File uploaded successfully: {} ({} bytes)",
+                full_path.display(),
+                total_bytes
+            );
+
             if let Ok(mut resp) = req.into_response(201, Some("Created"), &[("Location", &path)]) {
-                resp.write(format!("File uploaded successfully ({} bytes)", total_bytes).as_bytes())?;
+                resp.write(
+                    format!("File uploaded successfully ({} bytes)", total_bytes).as_bytes(),
+                )?;
                 resp.flush()?;
                 resp.release();
             }
@@ -368,6 +405,6 @@ fn handle_post_request(
             }
         }
     }
-    
+
     Ok(())
 }

@@ -38,9 +38,9 @@ fn main() -> anyhow::Result<()> {
 
     log::info!("Testing speed..");
 
-    // let (readspeed,writespeed) = test_sd_speed()?;
+    let (readspeed,writespeed) = test_sd_speed()?;
 
-    // log::info!("Read speed: {readspeed}, Write speed: {writespeed}");
+    log::info!("Read speed: {readspeed}, Write speed: {writespeed}");
     // Initialize WiFi in AP mode
     let wifi = setup_wifi_ap(peripherals.modem, sys_loop.clone(), nvs)?;
     log::info!("WiFi Access Point started, SSID: {}", config::WIFI_SSID);
