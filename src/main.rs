@@ -6,6 +6,7 @@ use esp_idf_svc::{
     nvs::EspDefaultNvsPartition,
 };
 use storage::test_sd_speed;
+use wifi::configure_wifi;
 
 mod config;
 mod server;
@@ -42,7 +43,7 @@ fn main() -> anyhow::Result<()> {
 
     log::info!("Read speed: {readspeed}, Write speed: {writespeed}");
     // Initialize WiFi in AP mode
-    let wifi = setup_wifi_ap(peripherals.modem, sys_loop.clone(), nvs)?;
+    let wifi = configure_wifi(peripherals.modem, sys_loop.clone(), nvs)?;
     log::info!("WiFi Access Point started, SSID: {}", config::WIFI_SSID);
 
     // Initialize HTTP server

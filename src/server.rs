@@ -355,15 +355,6 @@ fn handle_post_request(
                 match req.read(&mut buffer) {
                     Ok(0) => break, // End of request
                     Ok(bytes_read) => {
-                        // if let Err(e) = file.write_all(&buffer[..bytes_read]) {
-                        //     log::error!("Error writing to file: {}", e);
-                        //     if let Ok(mut resp) = req.into_status_response(500) {
-                        //         resp.write(b"Error writing file to storage")?;
-                        //         resp.flush()?;
-                        //         resp.release();
-                        //     }
-                        //     return Ok(());
-                        // }
                         if tx.send(buffer[..bytes_read].to_vec()).is_err() {
                             log::error!("Writer thread died");
                             break;
