@@ -83,28 +83,28 @@ pub fn register_handlers(resources: Arc<Mutex<AppResources<'static>>>) -> anyhow
     // Handler for GET requests - Directory listing and file download
     let get_root_path = root_path.clone();
     let get_manifest_manager = manifest_manager.clone();
-    server.fn_handler("/*", esp_idf_svc::http::Method::Get, move |req| {
+    server.fn_handler("/api/files/*", esp_idf_svc::http::Method::Get, move |req| {
         handle_get_request(req, get_root_path.clone(), chunk_size, get_manifest_manager.clone())
     })?;
 
     // Handler for POST requests - File upload
     let post_root_path = root_path.clone();
     let post_manifest_manager = manifest_manager.clone();
-    server.fn_handler("/*", esp_idf_svc::http::Method::Post, move |req| {
+    server.fn_handler("/api/files/*", esp_idf_svc::http::Method::Post, move |req| {
         handle_post_request(req, post_root_path.clone(), post_manifest_manager.clone())
     })?;
 
     // Handler for DELETE requests - File/Folder deletion
     let delete_root_path = root_path.clone();
     let delete_manifest_manager = manifest_manager.clone();
-    server.fn_handler("/*", esp_idf_svc::http::Method::Delete, move |req| {
+    server.fn_handler("/api/files/*", esp_idf_svc::http::Method::Delete, move |req| {
         handle_delete_request(req, delete_root_path.clone(), delete_manifest_manager.clone())
     })?;
 
     // Handler for MKCOL (Create Directory) requests
     let mkdir_root_path = root_path.clone();
     let mkdir_manifest_manager = manifest_manager.clone();
-    server.fn_handler("/*", esp_idf_svc::http::Method::MkCol, move |req| {
+    server.fn_handler("/api/files/*", esp_idf_svc::http::Method::MkCol, move |req| {
         handle_mkdir_request(req, mkdir_root_path.clone(), mkdir_manifest_manager.clone())
     })?;
 
@@ -118,7 +118,7 @@ fn handle_get_request(
     chunk_size: usize,
     manifest_manager: Arc<ManifestManager>,
 ) -> Result<(), anyhow::Error> {
-    let path = req.uri();
+    let path = req.uri().trim_start_matches("/api/files");
     let full_path = root_path.join(path.trim_start_matches('/'));
 
     info!("Handling GET request for: {:?}", full_path);
@@ -144,10 +144,10 @@ fn handle_get_request(
                 // Add parent directory link if not at root
                 if path != "/" {
                     let path_buf = PathBuf::from(path);
-                    let parent_path = path_buf.parent().unwrap_or_else(|| std::path::Path::new("/"));
+                    let parent_path = format!("/api/files{}",path_buf.parent().unwrap_or_else(|| std::path::Path::new("/")).display());
                     content.push_str(&format!(
                         "<li><a href=\"{}\">.. (Parent Directory)</a></li>",
-                        parent_path.display()
+                        parent_path
                     ));
                 }
 
@@ -155,9 +155,9 @@ fn handle_get_request(
                 let mut files = Vec::new();
 
                 for entry in manifest.entries.values() {
-                    let entry_path = format!("{}/{}", path.trim_end_matches('/'), entry.name);
+                    let entry_path = format!("/api/files{}/{}", path.trim_end_matches('/'), entry.name);
                     if entry.is_dir {
-                        dirs.push(format!("<li><a href=\"{}\">{}/</a></li>", entry_path, entry.name));
+                        dirs.push(format!("<li><a href=\"{}\">{}/</a></li>", entry_path, entry.name)); // Add trailing slash for directories
                     } else {
                         files.push(format!("<li><a href=\"{}\">{}</a></li>", entry_path, entry.name));
                     }
@@ -183,10 +183,10 @@ fn handle_get_request(
                  let mut content = String::from("<!DOCTYPE html><html><head><title>Directory Listing (Fallback)</title></head><body><h1>Directory Listing (Fallback)</h1><ul>");
                  if path != "/" {
                     let path_buf = PathBuf::from(path);
-                    let parent_path = path_buf.parent().unwrap_or_else(|| std::path::Path::new("/"));
+                    let parent_path = format!("/api/files{}",path_buf.parent().unwrap_or_else(|| std::path::Path::new("/")).display());
                     content.push_str(&format!(
                         "<li><a href=\"{}\">.. (Parent Directory)</a></li>",
-                        parent_path.display()
+                        parent_path
                     ));
                 }
                 if let Ok(entries) = fs::read_dir(&full_path) {
@@ -200,10 +200,10 @@ fn handle_get_request(
                             continue;
                         }
                         let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
-                        let entry_path = format!("{}/{}", path.trim_end_matches('/'), name);
+                        let entry_path = format!("/api/files{}/{}", path.trim_end_matches('/'), name);
 
                         if is_dir {
-                            dirs.push(format!("<li><a href=\"{}\">{}/</a></li>", entry_path, name));
+                            dirs.push(format!("<li><a href=\"{}\">{}/</a></li>", entry_path, name)); // Add trailing slash for directories
                         } else {
                             files.push(format!("<li><a href=\"{}\">{}</a></li>", entry_path, name));
                         }
@@ -378,25 +378,49 @@ fn handle_post_request(
     manifest_manager: Arc<ManifestManager>,
 ) -> Result<(), anyhow::Error> {
     info!("Received POST request for upload");
-    let path = req.uri().to_string();
+    let path = req.uri().trim_start_matches("/api/files").to_string();
     let full_path = root_path.join(path.trim_start_matches('/'));
 
     info!("Upload path: {:?}", full_path);
 
-    // Create parent directories if they don't exist
+    // Check if the parent directory exists. Do not create it automatically.
     if let Some(parent) = full_path.parent() {
         if !parent.exists() {
-            if let Err(e) = storage::create_directory(parent) {
-                error!("Failed to create directory structure: {}", e);
-                if let Ok(mut resp) = req.into_status_response(500) {
-                    resp.write(b"Failed to create directory structure")?;
-                    resp.flush()?;
-                    resp.release();
-                }
-                return Ok(());
+            error!("Parent directory does not exist for upload target: {:?}", parent);
+            if let Ok(mut resp) = req.into_status_response(409) { // 409 Conflict
+                resp.write(b"Parent directory does not exist")?;
+                resp.flush()?;
+                resp.release();
             }
+            return Ok(()); // Stop processing the request
+        }
+        // Also ensure the parent path is actually a directory
+        if !parent.is_dir() {
+             error!("Parent path is not a directory: {:?}", parent);
+            if let Ok(mut resp) = req.into_status_response(409) { // 409 Conflict
+                resp.write(b"Parent path is not a directory")?;
+                resp.flush()?;
+                resp.release();
+            }
+            return Ok(()); // Stop processing the request
+        }
+    } else {
+        // This case should ideally not happen if root_path is valid,
+        // but handle it defensively. It means the target is likely in the root.
+        // If full_path has no parent, it implies it's directly under the VFS root,
+        // which might not map directly to your logical root_path in all cases.
+        // Assuming root_path itself must exist.
+        if !root_path.exists() || !root_path.is_dir() {
+             error!("Root path does not exist or is not a directory: {:?}", root_path);
+             if let Ok(mut resp) = req.into_status_response(500) { // Internal error - config issue
+                resp.write(b"Server root path configuration error")?;
+                resp.flush()?;
+                resp.release();
+            }
+            return Ok(());
         }
     }
+
 
     // Check if we're trying to upload to a directory path
     if full_path.exists() && full_path.is_dir() {
@@ -433,21 +457,16 @@ fn handle_post_request(
             let mut total_bytes = 0;
 
             // Use a channel and a separate thread for writing to avoid blocking the HTTP server thread
-            let full_path_clone = full_path.clone();
             let (tx, rx): (SyncSender<Vec<u8>>, Receiver<Vec<u8>>) = sync_channel(4); // 4 buffers in flight
             std::thread::spawn(move || {
-                if let Ok(mut file) = File::create(full_path_clone) {
-                    while let Ok(buffer) = rx.recv() {
-                        if let Err(e) = file.write_all(&buffer) {
-                            error!("Error writing to file: {}", e);
-                            break;
-                        }
+                while let Ok(buffer) = rx.recv() {
+                    if let Err(e) = file.write_all(&buffer) {
+                        error!("Error writing to file: {}", e);
+                        break;
                     }
-                    if let Err(e) = file.flush() {
-                        error!("Error flushing file: {}", e);
-                    }
-                } else {
-                    error!("Failed to open file for writing in spawned thread");
+                }
+                if let Err(e) = file.flush() {
+                    error!("Error flushing file: {}", e);
                 }
             });
 
@@ -520,7 +539,7 @@ fn handle_delete_request(
     root_path: Arc<PathBuf>,
     manifest_manager: Arc<ManifestManager>,
 ) -> Result<(), anyhow::Error> {
-    let path = req.uri();
+    let path = req.uri().trim_start_matches("/api/files");
     let full_path = root_path.join(path.trim_start_matches('/'));
 
     info!("Handling DELETE request for: {:?}", full_path);
@@ -586,7 +605,7 @@ fn handle_mkdir_request(
     root_path: Arc<PathBuf>,
     manifest_manager: Arc<ManifestManager>,
 ) -> Result<(), anyhow::Error> {
-    let path = req.uri();
+    let path = req.uri().trim_start_matches("/api/files");
     let full_path = root_path.join(path.trim_start_matches('/'));
 
     info!("Handling MKCOL request for: {:?}", full_path);

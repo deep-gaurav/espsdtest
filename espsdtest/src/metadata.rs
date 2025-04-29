@@ -71,6 +71,7 @@ impl FolderManifest {
         // Serialize the manifest to binary
         let encoded: Vec<u8> = bincode::serialize(self)?;
 
+        info!("Write to temporary manifest");
         // Write to a temporary file first
         let mut temp_file = OpenOptions::new()
             .write(true)
@@ -82,6 +83,32 @@ impl FolderManifest {
         temp_file.flush()?;
         drop(temp_file); // Ensure the temporary file is closed
 
+        
+        // --- FIX STARTS HERE ---
+        // Check if the final destination exists and remove it if it does.
+        // This makes the subsequent rename operation more likely to succeed
+        // on filesystems that don't automatically overwrite.
+        if manifest_path.exists() {
+            info!("Removing existing manifest file: {:?}", manifest_path);
+            match fs::remove_file(&manifest_path) {
+                 Ok(_) => info!("Successfully removed existing manifest file."),
+                 // It's okay if it wasn't found (maybe deleted between check and remove), proceed.
+                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    info!("Existing manifest file was not found during removal attempt, proceeding.");
+                 }
+                 // Other errors during removal are problematic.
+                 Err(e) => {
+                    error!("Failed to remove existing manifest file {:?}: {}", manifest_path, e);
+                    // Also attempt to clean up the temp file if removal failed
+                    let _ = fs::remove_file(&temp_manifest_path);
+                    return Err(e.into());
+                 }
+            }
+        }
+        // --- FIX ENDS HERE ---
+
+
+        info!("Rename temporary manifest");
         // Rename the temporary file to the final manifest file
         fs::rename(&temp_manifest_path, &manifest_path)?;
         info!("Manifest saved successfully to {:?}", manifest_path);
@@ -159,19 +186,26 @@ impl ManifestManager {
 
         // Manifest not in cache, load it
         let manifest = FolderManifest::load_from_file(folder_path)?;
+        info!("Loaded manifest for {:?}", folder_path);
+
         let manifest_arc = Arc::new(Mutex::new(manifest));
         cache.insert(folder_path.to_path_buf(), Arc::clone(&manifest_arc));
-
+        info!("Inserted manifest to cache");
         Ok(manifest_arc)
     }
 
     // Save the manifest for a given folder path
     pub fn save_manifest(&self, folder_path: &Path) -> anyhow::Result<()> {
+        info!("Save manifest lock try");
         let cache = self.manifest_cache.lock().map_err(|e| anyhow::anyhow!("Failed to lock manifest cache: {:?}", e))?;
 
+        info!("Save manifest locked");
         if let Some(manifest_arc) = cache.get(folder_path) {
+            info!("Lock manifest cache arc");
             let manifest = manifest_arc.lock().map_err(|e| anyhow::anyhow!("Failed to lock manifest: {:?}", e))?;
+            info!("Manifest Locked, saving to file");
             manifest.save_to_file(folder_path)?;
+            info!("Manifest saved to file");
             Ok(())
         } else {
             Err(anyhow::anyhow!("Manifest for {:?} not found in cache", folder_path))
@@ -184,8 +218,9 @@ impl ManifestManager {
         let file_name = file_path.file_name().ok_or_else(|| anyhow::anyhow!("Invalid file name: {:?}", file_path))?.to_string_lossy().to_string();
 
         let manifest_arc = self.get_or_load_manifest(parent_folder)?;
+        info!("Got manifest arc");
         let mut manifest = manifest_arc.lock().map_err(|e| anyhow::anyhow!("Failed to lock manifest: {:?}", e))?;
-
+        info!("Got manifest lock");
         let is_dir = file_path.is_dir();
         let size = if is_dir { 0 } else { fs::metadata(file_path)?.len() };
         let mtime = get_mtime(file_path)?;
@@ -199,9 +234,12 @@ impl ManifestManager {
             is_dir,
         };
 
+        info!("Add entry to manifest");
         manifest.add_or_update_entry(metadata);
+        drop(manifest);
+        info!("Save manifest");
         self.save_manifest(parent_folder)?;
-
+        info!("Saved entry to manifest");
         Ok(())
     }
 
@@ -214,6 +252,8 @@ impl ManifestManager {
         let mut manifest = manifest_arc.lock().map_err(|e| anyhow::anyhow!("Failed to lock manifest: {:?}", e))?;
 
         manifest.remove_entry(&file_name);
+        drop(manifest);
+        
         self.save_manifest(parent_folder)?;
 
         Ok(())
