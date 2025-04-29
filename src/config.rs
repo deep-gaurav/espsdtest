@@ -8,6 +8,7 @@ pub const WIFI_CHANNEL: u8 = 6;
 // Server configuration
 pub const SERVER_PORT: u16 = 80;
 pub const MAX_UPLOAD_SIZE: u64 =  10 * 1024 * 1024 * 1024; // 10GB max upload size
+pub const MAX_CONNECTIONS: usize = 2; // Limit maximum connections
 
 // SD Card configuration
 pub const SD_CARD_MOUNT_POINT: &str = "/sdcard";
@@ -19,3 +20,6 @@ pub struct AppConfig {
     pub root_path: PathBuf,
     pub chunk_size: usize,
 }
+
+// Default root folder for the cloud storage
+pub const DEFAULT_ROOT_FOLDER: &str = "/sdcard/cloud";

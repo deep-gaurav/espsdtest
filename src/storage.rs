@@ -9,6 +9,10 @@ use esp_idf_svc::{
     io::vfs::MountedFatfs,
 };
 use log::info;
+use std::path::Path;
+use std::fs;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::{SD_CARD_MOUNT_POINT, SD_CARD_SPEED_KHZ};
 
@@ -111,6 +115,35 @@ pub fn get_content_type(path: &std::path::Path) -> &'static str {
         Some("json") => "application/json",
         Some("xml") => "application/xml",
         Some("zip") => "application/zip",
+        Some("bin") => "application/octet-stream", // Added for manifest files
         _ => "application/octet-stream",
     }
+}
+
+// Delete a file or directory
+pub fn delete_entry(path: &Path) -> anyhow::Result<()> {
+    if path.is_dir() {
+        fs::remove_dir_all(path)?;
+        info!("Deleted directory: {:?}", path);
+    } else {
+        fs::remove_file(path)?;
+        info!("Deleted file: {:?}", path);
+    }
+    Ok(())
+}
+
+// Create a directory and its parents
+pub fn create_directory(path: &Path) -> anyhow::Result<()> {
+    fs::create_dir_all(path)?;
+    info!("Created directory: {:?}", path);
+    Ok(())
+}
+
+
+// Get modification time of a file/directory as Unix timestamp
+pub fn get_mtime(path: &Path) -> anyhow::Result<u64> {
+    let metadata = fs::metadata(path)?;
+    let mtime = metadata.modified()?;
+    let duration_since_epoch = mtime.duration_since(UNIX_EPOCH)?;
+    Ok(duration_since_epoch.as_secs())
 }

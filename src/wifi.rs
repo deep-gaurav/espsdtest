@@ -59,6 +59,7 @@ pub fn configure_wifi(
         EspNetif::new(NetifStack::Ap)?,
     )?;
 
+    // TODO: Make client configuration dynamic or configurable
     let wifi_configuration = WifiConfiguration::Client(ClientConfiguration {
         ssid: "AirFiber-5G".try_into().unwrap(),
         bssid: None,
@@ -80,4 +81,13 @@ pub fn configure_wifi(
     info!("Wifi Interface info: {ip_info:?}");
 
     Ok(wifi)
+}
+
+// Function to get current IP information and connection status
+pub fn get_wifi_status(
+    wifi: &BlockingWifi<EspWifi<'static>>,
+) -> anyhow::Result<(std::net::Ipv4Addr, bool)> {
+    let ip_info = wifi.wifi().sta_netif().get_ip_info()?;
+    let is_connected = wifi.is_connected()?;
+    Ok((ip_info.ip, is_connected))
 }
