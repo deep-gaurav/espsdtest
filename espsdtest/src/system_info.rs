@@ -2,6 +2,7 @@ use std::ffi::CString;
 use std::str::FromStr;
 use std::path::Path;
 use esp_idf_svc::sys::{esp_vfs_fat_info,  esp_err_t, ESP_OK};
+use log::info;
 
 // Struct to hold system information
 #[derive(Debug, serde::Serialize)]
@@ -44,6 +45,7 @@ pub fn get_system_info(
         "Disconnected".to_string()
     };
 
+    info!("Get storage space for mount point: {mount_point:?}");
     let (total_space, free_space) = get_storage_space(mount_point)?;
 
     Ok(SystemInfo {

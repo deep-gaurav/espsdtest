@@ -453,7 +453,7 @@ fn handle_post_request(
     // Create or open file for writing
     match File::create(&full_path) {
         Ok(mut file) => {
-            let mut buffer = vec![0; 1024 * 128]; // 128KB buffer for reading chunks
+            let mut buffer = vec![0; 1024 * 64]; // 128KB buffer for reading chunks
             let mut total_bytes = 0;
 
             // Use a channel and a separate thread for writing to avoid blocking the HTTP server thread

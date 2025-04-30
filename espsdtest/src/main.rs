@@ -20,7 +20,6 @@ use crate::{
     config::{AppConfig, DEFAULT_ROOT_FOLDER},
     server::setup_http_server,
     storage::setup_sd_card,
-    wifi::setup_wifi_ap,
     metadata::ManifestManager,
     ble_provisioning::BleProvisioningServer, // Import the BLE server struct
 };
@@ -77,7 +76,7 @@ fn main() -> anyhow::Result<()> {
 
     
     let ble_device = BLEDevice::take();
-    let mut ble_server = BleProvisioningServer::new(ble_device, wifi_arc.clone(), root_path.into());
+    let mut ble_server = BleProvisioningServer::new(ble_device, wifi_arc.clone(), PathBuf::from("/sdcard").into());
     ble_server.start()?;
     log::info!("BLE Provisioning Server initialized");
 
@@ -108,7 +107,7 @@ fn main() -> anyhow::Result<()> {
         if let Ok(locked_resources) = leaked_resources.lock() {
              if let Ok(wifi) = locked_resources.wifi.lock() {
                  match crate::wifi::get_wifi_status(&wifi) {
-                    Ok((ip, connected)) => {
+                    Ok((ip, connected, is_ap)) => {
                         // You could send a BLE notification here if the status changes
                         // or periodically if a client is subscribed to the WiFi Status characteristic.
                         // This requires accessing the ble_server instance from here.
