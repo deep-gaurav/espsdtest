@@ -21,14 +21,6 @@ use crate::metadata::ManifestManager;
 pub const PERSONAL_CLOUD_SERVICE_UUID: &'static str = "e3aea549-ef01-413d-b981-eb34f12a91b2";
 pub const WIFI_CONFIG_CHARACTERISTIC_UUID: &'static str = "9ba7e609-1b31-48d0-b3f1-ab725255dac2";
 pub const WIFI_STATUS_CHARACTERISTIC_UUID: &'static str = "4b19f2c4-10ac-4e68-91d0-4e74a6ceda85";
-pub const DIR_LIST_REQUEST_CHARACTERISTIC_UUID: &'static str =
-    "b6c4219e-242d-4999-a099-657bc8c7e288";
-pub const DIR_LIST_RESPONSE_CHARACTERISTIC_UUID: &'static str =
-    "f2f0a3b6-8c2e-4d6d-affd-89880b6cb844";
-pub const METADATA_REQUEST_CHARACTERISTIC_UUID: &'static str =
-    "7c603293-2e90-471f-9abd-03228b7ff1ae";
-pub const METADATA_RESPONSE_CHARACTERISTIC_UUID: &'static str =
-    "fbae61a1-9427-4274-8c1f-1f5d6b002f8d";
 pub const SYSTEM_INFO_CHARACTERISTIC_UUID: &'static str = "42e0c238-6581-48e6-8371-afc57afd9d74";
 
 // Assume data structures are defined as in your original file
@@ -233,194 +225,6 @@ impl<'a> BleProvisioningServer<'a> {
         // or in response to WiFi status changes. You'll get a handle to this characteristic
         // and call wifi_status_characteristic.lock().set_value(...).notify();
 
-        // Directory Listing Request Characteristic (Write)
-        let dir_list_request_characteristic = service.lock().create_characteristic(
-            uuid128!(DIR_LIST_REQUEST_CHARACTERISTIC_UUID),
-            NimbleProperties::WRITE, // WRITE property
-        );
-        info!(
-            "Created Dir List Request Characteristic with UUID: {:?}",
-            uuid128!(DIR_LIST_REQUEST_CHARACTERISTIC_UUID)
-        );
-
-        let root_path_arc_clone = self.root_path.clone();
-        // let manifest_manager_arc_clone = self.manifest_manager.clone(); // Assuming ManifestManager is used
-        // To send a notification from here, we need access to the Dir List Response characteristic.
-        // We can get a handle to the service and then look up the characteristic by UUID.
-
-        dir_list_request_characteristic.lock().on_write({
-            let service = service.clone();
-            move |args| {
-                info!(
-                    "Received data on Dir List Request characteristic: {:?}",
-                    args.recv_data()
-                );
-                let received_data = args.recv_data();
-
-                // Handle directory listing request
-                match serde_json::from_slice::<BleDirListRequest>(received_data) {
-                    Ok(dir_list_req) => {
-                        info!("Parsed Dir List Request for path: '{}'", dir_list_req.path);
-
-                        // Construct the full path to the requested directory
-                        // Ensure the requested path is relative and doesn't escape the root
-                        let requested_path = PathBuf::from(dir_list_req.path.trim_start_matches('/'));
-                        let target_dir_path = root_path_arc_clone.join(&requested_path);
-
-                        // Construct the path to the manifest file
-                        let manifest_file_path = target_dir_path.join(".manifest.jsonl"); // <-- Use NDJSON extension
-                        info!("Attempting to read manifest file: {:?}", manifest_file_path);
-
-                        // Read the manifest file content
-                        let response_data_result = std::fs::read(&manifest_file_path);
-
-                        let dir_list_response_char_uuid =
-                            uuid128!(DIR_LIST_RESPONSE_CHARACTERISTIC_UUID);
-
-                        // Use block_on as we are in a sync callback but need async characteristic access
-                        esp_idf_svc::hal::task::block_on(async {
-                            if let Some(dir_list_response_characteristic) = service
-                                .lock()
-                                .get_characteristic(dir_list_response_char_uuid)
-                                .await
-                            {
-                                match response_data_result {
-                                    Ok(manifest_data) => {
-                                        info!(
-                                            "Sending manifest data ({} bytes) for path '{}'.",
-                                            manifest_data.len(),
-                                            dir_list_req.path
-                                        );
-                                        // Send the raw binary content of the manifest file
-                                        dir_list_response_characteristic
-                                            .lock()
-                                            .set_value(&manifest_data) // Pass the Vec<u8> directly
-                                            .notify();
-                                    }
-                                    Err(e) => {
-                                        error!("Failed to read manifest file {:?}: {}", manifest_file_path, e);
-                                        // Send an empty notification or an error indicator if preferred
-                                        dir_list_response_characteristic.lock().set_value(b"ERROR: Manifest read failed").notify();
-                                    }
-                                }
-                            } else {
-                                error!("Dir List Response characteristic not found.");
-                            }
-                        });
-                    }
-                    Err(err) => {
-                        error!(
-                            "Failed to parse Dir List Request data: {:?} - {:?}",
-                            String::from_utf8_lossy(received_data), err // Log as string for readability
-                        );
-                    }
-                }
-            }
-        });
-
-        // Directory Listing Response Characteristic (Notify)
-        // This characteristic's value will be set and notified by the handler of the request characteristic.
-        let _dir_list_response_characteristic = service.lock().create_characteristic(
-            uuid128!(DIR_LIST_RESPONSE_CHARACTERISTIC_UUID),
-            NimbleProperties::READ | NimbleProperties::NOTIFY, // Needs READ for CCCD to be readable, NOTIFY for notifications
-        );
-        info!(
-            "Created Dir List Response Characteristic with UUID: {:?}",
-            uuid128!(DIR_LIST_RESPONSE_CHARACTERISTIC_UUID)
-        );
-
-        // Metadata Request Characteristic (Write)
-        let metadata_request_characteristic = service.lock().create_characteristic(
-            uuid128!(METADATA_REQUEST_CHARACTERISTIC_UUID),
-            NimbleProperties::WRITE, // WRITE property
-        );
-        info!(
-            "Created Metadata Request Characteristic with UUID: {:?}",
-            uuid128!(METADATA_REQUEST_CHARACTERISTIC_UUID)
-        );
-
-        let root_path_arc_clone = self.root_path.clone();
-        let manifest_manager_arc_clone = self.manifest_manager.clone(); // Assuming ManifestManager is used
-        let service_arc = Arc::new(Mutex::new(service.clone())); // Clone service for access in closure
-
-        metadata_request_characteristic
-            .lock()
-            .on_write(move |args| {
-                info!(
-                    "Received data on Metadata Request characteristic: {:?}",
-                    args.recv_data()
-                );
-                let received_data = args.recv_data();
-
-                // Handle metadata request
-                match serde_json::from_slice::<BleMetadataRequest>(received_data) {
-                    Ok(metadata_req) => {
-                        info!("Parsed Metadata Request for path: '{}'", metadata_req.path);
-                        let requested_path = PathBuf::from(metadata_req.path.trim_start_matches('/'));
-                        let target_path = root_path_arc_clone.join(&requested_path);
-
-                        // Retrieve metadata using the new stream-based method
-                        let metadata_result = manifest_manager_arc_clone.get_entry_metadata(&target_path);
-
-                        // After retrieving metadata, send it via the Metadata Response characteristic
-
-                        // Access the service and find the response characteristic
-                        let service = match service_arc.lock() {
-                            Ok(service) => service,
-                            Err(e) => {
-                                error!("Failed to lock service mutex: {}", e);
-                                return; // Exit the closure on error
-                            }
-                        };
-
-                        let metadata_response_char_uuid = uuid128!(METADATA_RESPONSE_CHARACTERISTIC_UUID);
-
-                        esp_idf_svc::hal::task::block_on(async {
-                            if let Some(metadata_response_characteristic) = service
-                                .lock()
-                                .get_characteristic(metadata_response_char_uuid)
-                                .await
-                            {
-                                match metadata_result {
-                                    Ok(Some(metadata)) => {
-                                        let response_json = serde_json::to_string(&metadata).unwrap_or_else(|e| format!("{{\"error\":\"Serialization failed: {}\"}}", e));
-                                        info!("Sending metadata response ({} bytes) for path '{}'.", response_json.len(), metadata_req.path);
-                                        metadata_response_characteristic.lock().set_value(response_json.as_bytes()).notify();
-                                    }
-                                    Ok(None) => {
-                                        error!("Metadata not found in manifest for path '{}'", metadata_req.path);
-                                        metadata_response_characteristic.lock().set_value(b"ERROR: Metadata not found").notify();
-                                    }
-                                    Err(e) => {
-                                        error!("Failed to read manifest for metadata request '{}': {}", metadata_req.path, e);
-                                        metadata_response_characteristic.lock().set_value(b"ERROR: Manifest read failed").notify();
-                                    }
-                                }
-                            } else {
-                                error!("Metadata Response characteristic not found.");
-                            }
-                        });
-                    }
-
-                    Err(e) => {
-                        error!(
-                            "Failed to parse Metadata Request data: {:?} - {}",
-                            String::from_utf8_lossy(received_data), e // Log as string for readability
-                        );
-                    }
-                }
-            });
-
-        // Metadata Response Characteristic (Notify)
-        let _metadata_response_characteristic = service.lock().create_characteristic(
-            uuid128!(METADATA_RESPONSE_CHARACTERISTIC_UUID),
-            NimbleProperties::READ | NimbleProperties::NOTIFY, // READ for CCCD, NOTIFY for notifications
-        );
-        info!(
-            "Created Metadata Response Characteristic with UUID: {:?}",
-            uuid128!(METADATA_RESPONSE_CHARACTERISTIC_UUID)
-        );
-
         // System Info Characteristic (Read/Notify)
         let system_info_characteristic = service.lock().create_characteristic(
             uuid128!(SYSTEM_INFO_CHARACTERISTIC_UUID),
@@ -432,7 +236,6 @@ impl<'a> BleProvisioningServer<'a> {
         );
 
         let wifi_arc_clone = self.wifi.clone();
-        let root_path_arc_clone = self.root_path.clone();
         system_info_characteristic.lock().on_read({
             move |this, _| {
                 info!("Read from System Info characteristic.");
@@ -445,7 +248,6 @@ impl<'a> BleProvisioningServer<'a> {
                         return;
                     }
                 };
-                let root_path = root_path_arc_clone.as_ref();
 
                 // Retrieve and format system information
                 match crate::system_info::get_system_info(&wifi) {
@@ -510,14 +312,4 @@ pub enum WifiMode {
     Station,
     AccessPoint,
     Disabled,
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Debug)]
-pub struct BleDirListRequest {
-    pub path: String,
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Debug)]
-pub struct BleMetadataRequest {
-    pub path: String,
 }

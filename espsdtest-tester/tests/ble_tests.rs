@@ -12,10 +12,6 @@ use serde_json::{json, Value};
 const PERSONAL_CLOUD_SERVICE_UUID: Uuid = uuid!("e3aea549-ef01-413d-b981-eb34f12a91b2");
 const WIFI_CONFIG_CHARACTERISTIC_UUID: Uuid = uuid!("9ba7e609-1b31-48d0-b3f1-ab725255dac2");
 const WIFI_STATUS_CHARACTERISTIC_UUID: Uuid = uuid!("4b19f2c4-10ac-4e68-91d0-4e74a6ceda85");
-const DIR_LIST_REQUEST_CHARACTERISTIC_UUID: Uuid = uuid!("b6c4219e-242d-4999-a099-657bc8c7e288");
-const DIR_LIST_RESPONSE_CHARACTERISTIC_UUID: Uuid = uuid!("f2f0a3b6-8c2e-4d6d-affd-89880b6cb844");
-const METADATA_REQUEST_CHARACTERISTIC_UUID: Uuid = uuid!("7c603293-2e90-471f-9abd-03228b7ff1ae");
-const METADATA_RESPONSE_CHARACTERISTIC_UUID: Uuid = uuid!("fbae61a1-9427-4274-8c1f-1f5d6b002f8d");
 const SYSTEM_INFO_CHARACTERISTIC_UUID: Uuid = uuid!("42e0c238-6581-48e6-8371-afc57afd9d74");
 
 // Structure for HTTP System Info response (copied/adapted from api_tests.rs)
@@ -261,95 +257,6 @@ async fn test_ble_wifi_status_read_and_notify() -> Result<()> {
 
     peripheral.unsubscribe(wifi_status_char).await?;
     println!("Unsubscribed from WiFi Status notifications.");
-
-    peripheral.disconnect().await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_ble_dir_list_request_write_and_response_notify() -> Result<()> {
-    let peripheral = connect_to_device().await?;
-    peripheral.discover_services().await?;
-
-    let characteristics = peripheral.characteristics();
-    let dir_list_req_char = characteristics.iter()
-        .find(|c| c.uuid == DIR_LIST_REQUEST_CHARACTERISTIC_UUID)
-        .expect("Dir List Request Characteristic not found");
-    let dir_list_resp_char = characteristics.iter()
-        .find(|c| c.uuid == DIR_LIST_RESPONSE_CHARACTERISTIC_UUID)
-        .expect("Dir List Response Characteristic not found");
-
-    // Test Notify first to be ready for the response
-    peripheral.subscribe(dir_list_resp_char).await?;
-    println!("Subscribed to Dir List Response notifications.");
-
-    let mut notification_stream = peripheral.notifications().await?;
-
-    // Example Directory List Request data (replace with your actual struct and serialization)
-    let dir_request_data = json!({
-        "path": "/" // Request listing of the root directory
-    }).to_string();
-
-    println!("Writing Dir List Request: {}", dir_request_data);
-    peripheral.write(dir_list_req_char, dir_request_data.as_bytes(), WriteType::WithResponse).await?;
-    println!("Write successful. Waiting for response notification...");
-
-    // Wait for the directory listing response notification
-    if let Some(data) = time::timeout(Duration::from_secs(15), notification_stream.next()).await.ok().flatten() {
-        let received_listing = String::from_utf8_lossy(&data.value);
-        println!("Received Dir List Response Notification: {}", received_listing);
-        // Add assertions to parse and validate the received directory listing data
-    } else {
-        println!("No Dir List Response notification received within timeout.");
-    }
-
-    peripheral.unsubscribe(dir_list_resp_char).await?;
-    println!("Unsubscribed from Dir List Response notifications.");
-
-    peripheral.disconnect().await?;
-    Ok(())
-}
-
-
-#[tokio::test]
-async fn test_ble_metadata_request_write_and_response_notify() -> Result<()> {
-    let peripheral = connect_to_device().await?;
-    peripheral.discover_services().await?;
-
-    let characteristics = peripheral.characteristics();
-    let metadata_req_char = characteristics.iter()
-        .find(|c| c.uuid == METADATA_REQUEST_CHARACTERISTIC_UUID)
-        .expect("Metadata Request Characteristic not found");
-    let metadata_resp_char = characteristics.iter()
-        .find(|c| c.uuid == METADATA_RESPONSE_CHARACTERISTIC_UUID)
-        .expect("Metadata Response Characteristic not found");
-
-    // Test Notify first to be ready for the response
-    peripheral.subscribe(metadata_resp_char).await?;
-    println!("Subscribed to Metadata Response notifications.");
-
-    let mut notification_stream = peripheral.notifications().await?;
-
-    // Example Metadata Request data (replace with your actual struct and serialization)
-    let metadata_request_data = json!({
-        "path": "/example_file.txt" // Request metadata for a specific file
-    }).to_string();
-
-    println!("Writing Metadata Request: {}", metadata_request_data);
-    peripheral.write(metadata_req_char, metadata_request_data.as_bytes(), WriteType::WithResponse).await?;
-    println!("Write successful. Waiting for response notification...");
-
-    // Wait for the metadata response notification
-    if let Some(data) = time::timeout(Duration::from_secs(10), notification_stream.next()).await.ok().flatten() {
-        let received_metadata = String::from_utf8_lossy(&data.value);
-        println!("Received Metadata Response Notification: {}", received_metadata);
-        // Add assertions to parse and validate the received metadata data
-    } else {
-        println!("No Metadata Response notification received within timeout.");
-    }
-
-    peripheral.unsubscribe(metadata_resp_char).await?;
-    println!("Unsubscribed from Metadata Response notifications.");
 
     peripheral.disconnect().await?;
     Ok(())
