@@ -4,6 +4,8 @@ use std::path::Path;
 use esp_idf_svc::sys::{esp_vfs_fat_info,  esp_err_t, ESP_OK};
 use log::info;
 
+use crate::config::SD_CARD_MOUNT_POINT;
+
 // Struct to hold system information
 #[derive(Debug, serde::Serialize)]
 pub struct SystemInfo {
@@ -15,10 +17,10 @@ pub struct SystemInfo {
 }
 
 // Get storage space information
-pub fn get_storage_space(mount_point: &Path) -> anyhow::Result<(u64, u64)> {
+pub fn get_storage_space() -> anyhow::Result<(u64, u64)> {
     let mut total_bytes = 0;
     let mut free_bytes = 0;
-    let mount_point_cstr = CString::from_str(mount_point.to_str().ok_or(anyhow::anyhow!("mount point not str"))?)?;
+    let mount_point_cstr = CString::from_str(SD_CARD_MOUNT_POINT)?;
 
     // Use unsafe block to call the C function
     let ret: esp_err_t = unsafe {
@@ -35,7 +37,6 @@ pub fn get_storage_space(mount_point: &Path) -> anyhow::Result<(u64, u64)> {
 // Get system information
 pub fn get_system_info(
     wifi: &esp_idf_svc::wifi::BlockingWifi<esp_idf_svc::wifi::EspWifi<'static>>,
-    mount_point: &Path,
 ) -> anyhow::Result<SystemInfo> {
     let ip_info = wifi.wifi().sta_netif().get_ip_info()?;
     let ip_address = ip_info.ip.to_string();
@@ -45,8 +46,8 @@ pub fn get_system_info(
         "Disconnected".to_string()
     };
 
-    info!("Get storage space for mount point: {mount_point:?}");
-    let (total_space, free_space) = get_storage_space(mount_point)?;
+    info!("Get storage space");
+    let (total_space, free_space) = get_storage_space()?;
 
     Ok(SystemInfo {
         health: "ok".to_string(), // Basic health status

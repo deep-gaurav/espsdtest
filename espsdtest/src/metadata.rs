@@ -1,8 +1,8 @@
 use std::{
-    collections::HashMap,
+    // collections::HashMap, // No longer needed
     fs::{self, File, OpenOptions},
-    io::{Read, Write, Seek, SeekFrom},
-    path::{Path, PathBuf},
+    io::{Read, Write, Seek, SeekFrom, BufReader, BufWriter, BufRead},
+    path::{Path, PathBuf}, // Added BufReader, BufWriter, BufRead
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -20,117 +20,7 @@ pub struct FileMetadata {
     pub is_dir: bool,
 }
 
-// Define the structure for a folder's manifest
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct FolderManifest {
-    // Using a HashMap for quick lookup by name
-    pub entries: HashMap<String, FileMetadata>,
-}
-
-impl FolderManifest {
-    // Create a new empty manifest
-    pub fn new() -> Self {
-        Self {
-            entries: HashMap::new(),
-        }
-    }
-
-    // Load manifest from a binary file
-    // Uses double buffering by checking for a .tmp file
-    pub fn load_from_file(path: &Path) -> anyhow::Result<Self> {
-        let manifest_path = path.join(".manifest.bin");
-        let temp_manifest_path = path.join(".manifest.bin.tmp");
-
-        let file_to_load = if temp_manifest_path.exists() {
-            info!("Found temporary manifest file, attempting to load from {:?}", temp_manifest_path);
-            temp_manifest_path
-        } else {
-            manifest_path
-        };
-
-        if !file_to_load.exists() {
-            info!("Manifest file not found at {:?}, creating new manifest.", file_to_load);
-            return Ok(Self::new());
-        }
-
-        let mut file = File::open(file_to_load)?;
-        let mut buffer = Vec::new();
-        file.read_to_end(&mut buffer)?;
-
-        // Deserialize the manifest from binary
-        let manifest: FolderManifest = bincode::deserialize(&buffer)?;
-        info!("Manifest loaded successfully from {:?}", path);
-        Ok(manifest)
-    }
-
-    // Save manifest to a binary file using double buffering
-    pub fn save_to_file(&self, path: &Path) -> anyhow::Result<()> {
-        let manifest_path = path.join(".manifest.bin");
-        let temp_manifest_path = path.join(".manifest.bin.tmp");
-
-        // Serialize the manifest to binary
-        let encoded: Vec<u8> = bincode::serialize(self)?;
-
-        info!("Write to temporary manifest");
-        // Write to a temporary file first
-        let mut temp_file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&temp_manifest_path)?;
-
-        temp_file.write_all(&encoded)?;
-        temp_file.flush()?;
-        drop(temp_file); // Ensure the temporary file is closed
-
-        
-        // --- FIX STARTS HERE ---
-        // Check if the final destination exists and remove it if it does.
-        // This makes the subsequent rename operation more likely to succeed
-        // on filesystems that don't automatically overwrite.
-        if manifest_path.exists() {
-            info!("Removing existing manifest file: {:?}", manifest_path);
-            match fs::remove_file(&manifest_path) {
-                 Ok(_) => info!("Successfully removed existing manifest file."),
-                 // It's okay if it wasn't found (maybe deleted between check and remove), proceed.
-                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    info!("Existing manifest file was not found during removal attempt, proceeding.");
-                 }
-                 // Other errors during removal are problematic.
-                 Err(e) => {
-                    error!("Failed to remove existing manifest file {:?}: {}", manifest_path, e);
-                    // Also attempt to clean up the temp file if removal failed
-                    let _ = fs::remove_file(&temp_manifest_path);
-                    return Err(e.into());
-                 }
-            }
-        }
-        // --- FIX ENDS HERE ---
-
-
-        info!("Rename temporary manifest");
-        // Rename the temporary file to the final manifest file
-        fs::rename(&temp_manifest_path, &manifest_path)?;
-        info!("Manifest saved successfully to {:?}", manifest_path);
-
-        Ok(())
-    }
-
-    // Add or update a file metadata entry
-    pub fn add_or_update_entry(&mut self, metadata: FileMetadata) {
-        self.entries.insert(metadata.name.clone(), metadata);
-    }
-
-    // Remove a file metadata entry
-    pub fn remove_entry(&mut self, name: &str) {
-        self.entries.remove(name);
-    }
-
-    // Get metadata for a specific entry
-    pub fn get_entry(&self, name: &str) -> Option<&FileMetadata> {
-        self.entries.get(name)
-    }
-}
+// FolderManifest struct is removed as we operate directly on the file now.
 
 // Helper function to calculate CRC32 of a file
 pub fn calculate_crc32(path: &Path) -> anyhow::Result<u32> {
@@ -163,99 +53,217 @@ pub fn get_mtime(path: &Path) -> anyhow::Result<u64> {
 
 // Struct to manage manifests in memory
 pub struct ManifestManager {
-    // Cache of loaded manifests, keyed by folder path
-    manifest_cache: Mutex<HashMap<PathBuf, Arc<Mutex<FolderManifest>>>>,
+    // No longer holds manifest data, just the root path.
+    // Mutex might not be strictly necessary anymore if methods are self-contained, but keep for now.
     root_path: PathBuf,
 }
 
 impl ManifestManager {
     pub fn new(root_path: PathBuf) -> Self {
         Self {
-            manifest_cache: Mutex::new(HashMap::new()),
+            // current_manifest: Mutex::new(None), // Removed
             root_path,
         }
     }
 
-    // Get or load the manifest for a given folder path
-    pub fn get_or_load_manifest(&self, folder_path: &Path) -> anyhow::Result<Arc<Mutex<FolderManifest>>> {
-        let mut cache = self.manifest_cache.lock().map_err(|e| anyhow::anyhow!("Failed to lock manifest cache: {:?}", e))?;
-
-        if let Some(manifest) = cache.get(folder_path) {
-            return Ok(Arc::clone(manifest));
-        }
-
-        // Manifest not in cache, load it
-        let manifest = FolderManifest::load_from_file(folder_path)?;
-        info!("Loaded manifest for {:?}", folder_path);
-
-        let manifest_arc = Arc::new(Mutex::new(manifest));
-        cache.insert(folder_path.to_path_buf(), Arc::clone(&manifest_arc));
-        info!("Inserted manifest to cache");
-        Ok(manifest_arc)
-    }
-
-    // Save the manifest for a given folder path
-    pub fn save_manifest(&self, folder_path: &Path) -> anyhow::Result<()> {
-        info!("Save manifest lock try");
-        let cache = self.manifest_cache.lock().map_err(|e| anyhow::anyhow!("Failed to lock manifest cache: {:?}", e))?;
-
-        info!("Save manifest locked");
-        if let Some(manifest_arc) = cache.get(folder_path) {
-            info!("Lock manifest cache arc");
-            let manifest = manifest_arc.lock().map_err(|e| anyhow::anyhow!("Failed to lock manifest: {:?}", e))?;
-            info!("Manifest Locked, saving to file");
-            manifest.save_to_file(folder_path)?;
-            info!("Manifest saved to file");
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!("Manifest for {:?} not found in cache", folder_path))
-        }
-    }
+    // Save the manifest for a given folder path - No longer needed, replaced by specific operations
+    // pub fn save_manifest(&self, folder_path: &Path) -> anyhow::Result<()> { ... }
 
     // Add or update an entry in the manifest for a given file path
     pub fn add_or_update_entry(&self, file_path: &Path) -> anyhow::Result<()> {
-        let parent_folder = file_path.parent().ok_or_else(|| anyhow::anyhow!("Invalid file path: {:?}", file_path))?;
-        let file_name = file_path.file_name().ok_or_else(|| anyhow::anyhow!("Invalid file name: {:?}", file_path))?.to_string_lossy().to_string();
-
-        let manifest_arc = self.get_or_load_manifest(parent_folder)?;
-        info!("Got manifest arc");
-        let mut manifest = manifest_arc.lock().map_err(|e| anyhow::anyhow!("Failed to lock manifest: {:?}", e))?;
-        info!("Got manifest lock");
         let is_dir = file_path.is_dir();
         let size = if is_dir { 0 } else { fs::metadata(file_path)?.len() };
         let mtime = get_mtime(file_path)?;
         let crc32 = if is_dir { 0 } else { calculate_crc32(file_path)? };
+        let filename = file_path.file_name().ok_or(anyhow::anyhow!("Couldnt get file name"))?;
 
         let metadata = FileMetadata {
-            name: file_name,
+            name: filename.to_string_lossy().to_string(),
             size,
             mtime,
             crc32,
             is_dir,
         };
 
-        info!("Add entry to manifest");
-        manifest.add_or_update_entry(metadata);
-        drop(manifest);
-        info!("Save manifest");
-        self.save_manifest(parent_folder)?;
-        info!("Saved entry to manifest");
+        let parent_folder = file_path.parent().ok_or_else(|| anyhow::anyhow!("Invalid file path (no parent): {:?}", file_path))?;
+        let manifest_path = parent_folder.join(".manifest.jsonl");
+        let file_name = metadata.name.clone(); // Use name from calculated metadata
+
+        info!("Adding/updating entry '{}' in manifest {:?}", file_name, manifest_path);
+
+        // This operation requires rewriting the file to ensure atomicity and handle updates.
+        // A simpler append-only approach could be used if updates weren't needed or handled differently.
+        rewrite_manifest_excluding(&manifest_path, &file_name, Some(&metadata))?;
+
+        info!("Manifest updated successfully for entry '{}'", file_name);
         Ok(())
     }
 
     // Remove an entry from the manifest for a given file path
     pub fn remove_entry(&self, file_path: &Path) -> anyhow::Result<()> {
-        let parent_folder = file_path.parent().ok_or_else(|| anyhow::anyhow!("Invalid file path: {:?}", file_path))?;
+        let parent_folder = file_path.parent().ok_or_else(|| anyhow::anyhow!("Invalid file path (no parent): {:?}", file_path))?;
         let file_name = file_path.file_name().ok_or_else(|| anyhow::anyhow!("Invalid file name: {:?}", file_path))?.to_string_lossy().to_string();
+        let manifest_path = parent_folder.join(".manifest.jsonl");
 
-        let manifest_arc = self.get_or_load_manifest(parent_folder)?;
-        let mut manifest = manifest_arc.lock().map_err(|e| anyhow::anyhow!("Failed to lock manifest: {:?}", e))?;
+        info!("Removing entry '{}' from manifest {:?}", file_name, manifest_path);
 
-        manifest.remove_entry(&file_name);
-        drop(manifest);
-        
-        self.save_manifest(parent_folder)?;
+        // Removal requires rewriting the file without the specified entry.
+        rewrite_manifest_excluding(&manifest_path, &file_name, None)?;
 
+        info!("Manifest updated successfully, removed entry '{}'", file_name);
         Ok(())
     }
+
+    // Get metadata for a specific file by streaming the manifest
+    pub fn get_entry_metadata(&self, file_path: &Path) -> anyhow::Result<Option<FileMetadata>> {
+        let parent_folder = file_path.parent().ok_or_else(|| anyhow::anyhow!("Invalid file path (no parent): {:?}", file_path))?;
+        let file_name = file_path.file_name().ok_or_else(|| anyhow::anyhow!("Invalid file name: {:?}", file_path))?.to_string_lossy().to_string();
+        let manifest_path = parent_folder.join(".manifest.jsonl");
+
+        read_manifest_entry(&manifest_path, &file_name)
+    }
+
+    // Get all entries for a directory by streaming the manifest
+    pub fn get_directory_listing(&self, folder_path: &Path) -> anyhow::Result<Vec<FileMetadata>> {
+        let manifest_path = folder_path.join(".manifest.jsonl");
+        read_all_manifest_entries(&manifest_path)
+    }
+}
+
+// --- Helper Functions for Stream-Based Manifest Operations ---
+
+/// Reads a manifest file line by line and returns the metadata for a specific entry name.
+fn read_manifest_entry(manifest_path: &Path, entry_name: &str) -> anyhow::Result<Option<FileMetadata>> {
+    if !manifest_path.exists() {
+        info!("Manifest file not found at {:?}, cannot get entry.", manifest_path);
+        return Ok(None);
+    }
+
+    let file = File::open(manifest_path)?;
+    let reader = BufReader::new(file);
+
+    for (line_num, line_result) in reader.lines().enumerate() {
+        let line = match line_result {
+            Ok(l) => l,
+            Err(e) => {
+                error!("Error reading line {} from manifest {:?}: {}", line_num + 1, manifest_path, e);
+                continue; // Skip malformed lines
+            }
+        };
+        if line.trim().is_empty() {
+            continue; // Skip empty lines
+        }
+        match serde_json::from_str::<FileMetadata>(&line) {
+            Ok(metadata) => {
+                if metadata.name == entry_name {
+                    info!("Found entry '{}' in manifest {:?}", entry_name, manifest_path);
+                    return Ok(Some(metadata));
+                }
+            }
+            Err(e) => error!("Failed to parse manifest line {} ('{}'): {}", line_num + 1, line, e),
+        }
+    }
+
+    info!("Entry '{}' not found in manifest {:?}", entry_name, manifest_path);
+    Ok(None)
+}
+
+/// Reads a manifest file line by line and returns a Vec of all valid entries.
+fn read_all_manifest_entries(manifest_path: &Path) -> anyhow::Result<Vec<FileMetadata>> {
+    let mut entries = Vec::new();
+    if !manifest_path.exists() {
+        info!("Manifest file not found at {:?}, returning empty list.", manifest_path);
+        return Ok(entries);
+    }
+
+    let file = File::open(manifest_path)?;
+    let reader = BufReader::new(file);
+
+    for (line_num, line_result) in reader.lines().enumerate() {
+        let line = match line_result {
+            Ok(l) => l,
+            Err(e) => {
+                error!("Error reading line {} from manifest {:?}: {}", line_num + 1, manifest_path, e);
+                continue; // Skip malformed lines
+            }
+        };
+        if line.trim().is_empty() {
+            continue; // Skip empty lines
+        }
+        match serde_json::from_str::<FileMetadata>(&line) {
+            Ok(metadata) => entries.push(metadata),
+            Err(e) => error!("Failed to parse manifest line {} ('{}'): {}", line_num + 1, line, e),
+        }
+    }
+    info!("Read {} entries from manifest {:?}", entries.len(), manifest_path);
+    Ok(entries)
+}
+
+/// Rewrites the manifest file, excluding a specific entry, and optionally appending a new one.
+/// Uses a temporary file and rename for atomicity.
+fn rewrite_manifest_excluding(manifest_path: &Path, exclude_name: &str, append_entry: Option<&FileMetadata>) -> anyhow::Result<()> {
+    let temp_manifest_path = manifest_path.with_extension("jsonl.tmp");
+
+    info!("Rewriting manifest {:?} to temp file {:?}", manifest_path, temp_manifest_path);
+
+    // Open temp file for writing
+    let temp_file = OpenOptions::new().write(true).create(true).truncate(true).open(&temp_manifest_path)?;
+    let mut writer = BufWriter::new(temp_file);
+
+    // Read original file line by line (if it exists)
+    if manifest_path.exists() {
+        let file = File::open(manifest_path)?;
+        let reader = BufReader::new(file);
+
+        for line_result in reader.lines() {
+            let line = line_result?;
+            if line.trim().is_empty() { continue; }
+
+            // Try parsing, write if it doesn't match exclude_name
+            if let Ok(metadata) = serde_json::from_str::<FileMetadata>(&line) {
+                if metadata.name != exclude_name {
+                    writer.write_all(line.as_bytes())?;
+                    writer.write_all(b"\n")?;
+                } else {
+                    info!("Excluding entry '{}' during rewrite.", exclude_name);
+                }
+            } else {
+                // Write malformed lines back as they were? Or skip? Skipping for now.
+                error!("Skipping malformed line during rewrite: {}", line);
+            }
+        }
+    }
+
+    // Append the new/updated entry if provided
+    if let Some(entry_to_append) = append_entry {
+        info!("Appending entry '{}' during rewrite.", entry_to_append.name);
+        serde_json::to_writer(&mut writer, entry_to_append)?;
+        writer.write_all(b"\n")?;
+    }
+
+    // Finalize write to temp file
+    writer.flush()?;
+    drop(writer.into_inner().map_err(|e| e.into_error())?); // Ensure file is closed
+
+    // --- Atomic Rename ---
+    // Remove original file before renaming (optional but safer on some systems)
+    if manifest_path.exists() {
+        fs::remove_file(manifest_path).map_err(|e| {
+            error!("Failed to remove original manifest {:?} before rename: {}", manifest_path, e);
+            // Attempt cleanup of temp file
+            let _ = fs::remove_file(&temp_manifest_path);
+            e
+        })?;
+    }
+
+    // Rename temp to final
+    fs::rename(&temp_manifest_path, manifest_path).map_err(|e| {
+        error!("Failed to rename temp manifest {:?} to {:?}: {}", temp_manifest_path, manifest_path, e);
+        // Attempt cleanup of temp file
+        let _ = fs::remove_file(&temp_manifest_path);
+        e
+    })?;
+
+    info!("Successfully rewrote manifest to {:?}", manifest_path);
+    Ok(())
 }

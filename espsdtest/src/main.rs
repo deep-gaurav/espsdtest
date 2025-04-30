@@ -76,7 +76,7 @@ fn main() -> anyhow::Result<()> {
 
     
     let ble_device = BLEDevice::take();
-    let mut ble_server = BleProvisioningServer::new(ble_device, wifi_arc.clone(), PathBuf::from("/sdcard").into());
+    let mut ble_server = BleProvisioningServer::new(ble_device, wifi_arc.clone(), root_path.into(),manifest_manager.clone());
     ble_server.start()?;
     log::info!("BLE Provisioning Server initialized");
 

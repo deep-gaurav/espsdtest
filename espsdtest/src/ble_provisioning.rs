@@ -9,6 +9,8 @@ use std::path::PathBuf; // Assuming you still use PathBuf
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::metadata::ManifestManager;
+
 // Assume these are defined elsewhere as in your original file
 // use crate::{metadata::{ManifestManager, FileMetadata}, system_info::SystemInfo};
 // use crate::wifi::{BleWifiConfig, WifiMode, get_wifi_status}; // Assuming WiFi handling is in wifi.rs
@@ -47,7 +49,7 @@ pub struct BleProvisioningServer<'a> {
     // Shared resources, protected by Arc<Mutex<>> for access from closures
     wifi: Arc<Mutex<BlockingWifi<esp_idf_svc::wifi::EspWifi<'static>>>>,
     root_path: Arc<PathBuf>,
-    // manifest_manager: Arc<ManifestManager>, // Assuming ManifestManager is still used
+    manifest_manager: Arc<ManifestManager>, // Assuming ManifestManager is still used
 }
 
 impl<'a> BleProvisioningServer<'a> {
@@ -56,13 +58,13 @@ impl<'a> BleProvisioningServer<'a> {
         ble_device: &'a mut esp32_nimble::BLEDevice,
         wifi: Arc<Mutex<BlockingWifi<esp_idf_svc::wifi::EspWifi<'static>>>>,
         root_path: Arc<PathBuf>,
-        // manifest_manager: Arc<ManifestManager>,
+        manifest_manager: Arc<ManifestManager>,
     ) -> Self {
         Self {
             ble_device,
             wifi,
             root_path,
-            // manifest_manager,
+            manifest_manager,
         }
     }
 
@@ -258,29 +260,49 @@ impl<'a> BleProvisioningServer<'a> {
                 // Handle directory listing request
                 match serde_json::from_slice::<BleDirListRequest>(received_data) {
                     Ok(dir_list_req) => {
-                        info!("Parsed Dir List Request: {:?}", dir_list_req);
-                        // TODO: Implement directory listing logic
-                        // Access root_path_arc_clone and potentially manifest_manager_arc_clone
+                        info!("Parsed Dir List Request for path: '{}'", dir_list_req.path);
 
-                        // After generating the directory listing data, send it via the Dir List Response characteristic
+                        // Construct the full path to the requested directory
+                        // Ensure the requested path is relative and doesn't escape the root
+                        let requested_path = PathBuf::from(dir_list_req.path.trim_start_matches('/'));
+                        let target_dir_path = root_path_arc_clone.join(&requested_path);
+
+                        // Construct the path to the manifest file
+                        let manifest_file_path = target_dir_path.join(".manifest.jsonl"); // <-- Use NDJSON extension
+                        info!("Attempting to read manifest file: {:?}", manifest_file_path);
+
+                        // Read the manifest file content
+                        let response_data_result = std::fs::read(&manifest_file_path);
+
                         let dir_list_response_char_uuid =
                             uuid128!(DIR_LIST_RESPONSE_CHARACTERISTIC_UUID);
 
+                        // Use block_on as we are in a sync callback but need async characteristic access
                         esp_idf_svc::hal::task::block_on(async {
                             if let Some(dir_list_response_characteristic) = service
                                 .lock()
                                 .get_characteristic(dir_list_response_char_uuid)
                                 .await
                             {
-                                let response_data = b"Directory listing data..."; // Replace with actual data (serialize your directory listing)
-                                info!(
-                                    "Sending directory listing data ({} bytes).",
-                                    response_data.len()
-                                );
-                                dir_list_response_characteristic
-                                    .lock()
-                                    .set_value(response_data)
-                                    .notify();
+                                match response_data_result {
+                                    Ok(manifest_data) => {
+                                        info!(
+                                            "Sending manifest data ({} bytes) for path '{}'.",
+                                            manifest_data.len(),
+                                            dir_list_req.path
+                                        );
+                                        // Send the raw binary content of the manifest file
+                                        dir_list_response_characteristic
+                                            .lock()
+                                            .set_value(&manifest_data) // Pass the Vec<u8> directly
+                                            .notify();
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to read manifest file {:?}: {}", manifest_file_path, e);
+                                        // Send an empty notification or an error indicator if preferred
+                                        dir_list_response_characteristic.lock().set_value(b"ERROR: Manifest read failed").notify();
+                                    }
+                                }
                             } else {
                                 error!("Dir List Response characteristic not found.");
                             }
@@ -289,7 +311,7 @@ impl<'a> BleProvisioningServer<'a> {
                     Err(err) => {
                         error!(
                             "Failed to parse Dir List Request data: {:?} - {:?}",
-                            received_data, err
+                            String::from_utf8_lossy(received_data), err // Log as string for readability
                         );
                     }
                 }
@@ -318,7 +340,7 @@ impl<'a> BleProvisioningServer<'a> {
         );
 
         let root_path_arc_clone = self.root_path.clone();
-        // let manifest_manager_arc_clone = self.manifest_manager.clone(); // Assuming ManifestManager is used
+        let manifest_manager_arc_clone = self.manifest_manager.clone(); // Assuming ManifestManager is used
         let service_arc = Arc::new(Mutex::new(service.clone())); // Clone service for access in closure
 
         metadata_request_characteristic
@@ -333,13 +355,14 @@ impl<'a> BleProvisioningServer<'a> {
                 // Handle metadata request
                 match serde_json::from_slice::<BleMetadataRequest>(received_data) {
                     Ok(metadata_req) => {
-                        info!("Parsed Metadata Request: {:?}", metadata_req);
-                        // TODO: Implement metadata retrieval logic
-                        // Access root_path_arc_clone and potentially manifest_manager_arc_clone
+                        info!("Parsed Metadata Request for path: '{}'", metadata_req.path);
+                        let requested_path = PathBuf::from(metadata_req.path.trim_start_matches('/'));
+                        let target_path = root_path_arc_clone.join(&requested_path);
+
+                        // Retrieve metadata using the new stream-based method
+                        let metadata_result = manifest_manager_arc_clone.get_entry_metadata(&target_path);
 
                         // After retrieving metadata, send it via the Metadata Response characteristic
-                        let metadata_response_char_uuid =
-                            uuid128!(METADATA_RESPONSE_CHARACTERISTIC_UUID);
 
                         // Access the service and find the response characteristic
                         let service = match service_arc.lock() {
@@ -349,18 +372,30 @@ impl<'a> BleProvisioningServer<'a> {
                                 return; // Exit the closure on error
                             }
                         };
+
+                        let metadata_response_char_uuid = uuid128!(METADATA_RESPONSE_CHARACTERISTIC_UUID);
+
                         esp_idf_svc::hal::task::block_on(async {
                             if let Some(metadata_response_characteristic) = service
                                 .lock()
                                 .get_characteristic(metadata_response_char_uuid)
                                 .await
                             {
-                                let response_data = b"Metadata data..."; // Replace with actual data (serialize your metadata)
-                                info!("Sending metadata data ({} bytes).", response_data.len());
-                                metadata_response_characteristic
-                                    .lock()
-                                    .set_value(response_data)
-                                    .notify();
+                                match metadata_result {
+                                    Ok(Some(metadata)) => {
+                                        let response_json = serde_json::to_string(&metadata).unwrap_or_else(|e| format!("{{\"error\":\"Serialization failed: {}\"}}", e));
+                                        info!("Sending metadata response ({} bytes) for path '{}'.", response_json.len(), metadata_req.path);
+                                        metadata_response_characteristic.lock().set_value(response_json.as_bytes()).notify();
+                                    }
+                                    Ok(None) => {
+                                        error!("Metadata not found in manifest for path '{}'", metadata_req.path);
+                                        metadata_response_characteristic.lock().set_value(b"ERROR: Metadata not found").notify();
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to read manifest for metadata request '{}': {}", metadata_req.path, e);
+                                        metadata_response_characteristic.lock().set_value(b"ERROR: Manifest read failed").notify();
+                                    }
+                                }
                             } else {
                                 error!("Metadata Response characteristic not found.");
                             }
@@ -370,7 +405,7 @@ impl<'a> BleProvisioningServer<'a> {
                     Err(e) => {
                         error!(
                             "Failed to parse Metadata Request data: {:?} - {}",
-                            received_data, e
+                            String::from_utf8_lossy(received_data), e // Log as string for readability
                         );
                     }
                 }
@@ -413,7 +448,7 @@ impl<'a> BleProvisioningServer<'a> {
                 let root_path = root_path_arc_clone.as_ref();
 
                 // Retrieve and format system information
-                match crate::system_info::get_system_info(&wifi, &root_path) {
+                match crate::system_info::get_system_info(&wifi) {
                     // Assuming get_system_info exists
                     Ok(system_info) => {
                         let response = serde_json::json!(system_info).to_string();

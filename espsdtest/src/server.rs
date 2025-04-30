@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File},
-    io::{Read, Seek, Write},
+    io::{BufRead, Read, Seek, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -75,9 +75,8 @@ pub fn register_handlers(resources: Arc<Mutex<AppResources<'static>>>) -> anyhow
 
     // Handler for System API
     let system_wifi_handle = wifi_handle.clone();
-    let system_mount_point = Arc::new(PathBuf::from(crate::config::SD_CARD_MOUNT_POINT));
     server.fn_handler("/api/system", esp_idf_svc::http::Method::Get, move |req| {
-        handle_system_request(req, system_wifi_handle.clone(), system_mount_point.clone())
+        handle_system_request(req, system_wifi_handle.clone())
     })?;
 
     // Handler for GET requests - Directory listing and file download
@@ -135,92 +134,16 @@ fn handle_get_request(
 
     if full_path.is_dir() {
         // Directory listing - use manifest for faster listing
-        info!("Listing directory: {:?}", full_path);
-        match manifest_manager.get_or_load_manifest(&full_path) {
-            Ok(manifest_arc) => {
-                let manifest = manifest_arc.lock().map_err(|e| anyhow::anyhow!("Failed to lock manifest: {:?}", e))?;
-                let mut content = String::from("<!DOCTYPE html><html><head><title>Directory Listing</title></head><body><h1>Directory Listing</h1><ul>");
-
-                // Add parent directory link if not at root
-                if path != "/" {
-                    let path_buf = PathBuf::from(path);
-                    let parent_path = format!("/api/files{}",path_buf.parent().unwrap_or_else(|| std::path::Path::new("/")).display());
-                    content.push_str(&format!(
-                        "<li><a href=\"{}\">.. (Parent Directory)</a></li>",
-                        parent_path
-                    ));
-                }
-
-                let mut dirs = Vec::new();
-                let mut files = Vec::new();
-
-                for entry in manifest.entries.values() {
-                    let entry_path = format!("/api/files{}/{}", path.trim_end_matches('/'), entry.name);
-                    if entry.is_dir {
-                        dirs.push(format!("<li><a href=\"{}\">{}/</a></li>", entry_path, entry.name)); // Add trailing slash for directories
-                    } else {
-                        files.push(format!("<li><a href=\"{}\">{}</a></li>", entry_path, entry.name));
-                    }
-                }
-
-                // Sort and append directories first, then files
-                dirs.sort();
-                files.sort();
-                content.push_str(&dirs.join(""));
-                content.push_str(&files.join(""));
-
-                content.push_str("</ul><hr><p>ESP32 Cloud Server</p></body></html>");
-
-                if let Ok(mut resp) = req.into_response(200, Some("OK"), &[("Content-Type", "text/html")]) {
-                    resp.write(content.as_bytes())?;
-                    resp.flush()?;
-                    resp.release();
-                }
-            }
-            Err(e) => {
-                error!("Error loading manifest for {:?}: {}", full_path, e);
-                // Fallback to basic file system listing if manifest loading fails
-                 let mut content = String::from("<!DOCTYPE html><html><head><title>Directory Listing (Fallback)</title></head><body><h1>Directory Listing (Fallback)</h1><ul>");
-                 if path != "/" {
-                    let path_buf = PathBuf::from(path);
-                    let parent_path = format!("/api/files{}",path_buf.parent().unwrap_or_else(|| std::path::Path::new("/")).display());
-                    content.push_str(&format!(
-                        "<li><a href=\"{}\">.. (Parent Directory)</a></li>",
-                        parent_path
-                    ));
-                }
-                if let Ok(entries) = fs::read_dir(&full_path) {
-                    let mut dirs = Vec::new();
-                    let mut files = Vec::new();
-
-                    for entry in entries.flatten() {
-                        let name = entry.file_name().to_string_lossy().to_string();
-                        // Skip manifest files in listing
-                        if name == ".manifest.bin" || name == ".manifest.bin.tmp" {
-                            continue;
-                        }
-                        let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
-                        let entry_path = format!("/api/files{}/{}", path.trim_end_matches('/'), name);
-
-                        if is_dir {
-                            dirs.push(format!("<li><a href=\"{}\">{}/</a></li>", entry_path, name)); // Add trailing slash for directories
-                        } else {
-                            files.push(format!("<li><a href=\"{}\">{}</a></li>", entry_path, name));
-                        }
-                    }
-
-                    dirs.sort();
-                    files.sort();
-                    content.push_str(&dirs.join(""));
-                    content.push_str(&files.join(""));
-                }
-                content.push_str("</ul><hr><p>ESP32 Cloud Server</p></body></html>");
-                 if let Ok(mut resp) = req.into_response(500, Some("Internal Server Error"), &[("Content-Type", "text/html")]) {
-                    resp.write(content.as_bytes())?;
-                    resp.flush()?;
-                    resp.release();
-                }
-            }
+        info!("GET request for directory path {:?} - Not allowed via /api/files/. Use /api/metadata/ instead.", full_path);
+        // Return 405 Method Not Allowed for directory listings via this endpoint
+        if let Ok(mut resp) = req.into_response(
+            405,
+            Some("Method Not Allowed"),
+            &[("Content-Type", "text/plain")],
+        ) {
+            resp.write(b"Directory listing not supported via this endpoint. Use /api/metadata/.")?;
+            resp.flush()?;
+            resp.release();
         }
     } else {
         // File content with chunked downloading
@@ -676,20 +599,54 @@ fn handle_metadata_request(
 
     if full_path.is_dir() {
         // Return metadata for all entries in the directory from the manifest
-        match manifest_manager.get_or_load_manifest(&full_path) {
-            Ok(manifest_arc) => {
-                let manifest = manifest_arc.lock().map_err(|e| anyhow::anyhow!("Failed to lock manifest: {:?}", e))?;
-                let metadata_list: Vec<&FileMetadata> = manifest.entries.values().collect();
-                let json_response = json!(metadata_list).to_string();
+        // Stream the JSON array directly from the manifest file
+        let manifest_path = full_path.join(".manifest.jsonl");
+        info!("Streaming metadata from manifest: {:?}", manifest_path);
 
+        if !manifest_path.exists() {
+            info!("Manifest file not found for streaming: {:?}", manifest_path);
+            // Return an empty JSON array if the manifest doesn't exist
+            if let Ok(mut resp) = req.into_response(200, Some("OK"), &[("Content-Type", "application/json")]) {
+                resp.write(b"[]")?;
+                resp.flush()?;
+                resp.release();
+            }
+            return Ok(());
+        }
+
+        match File::open(&manifest_path) {
+            Ok(file) => {
                 if let Ok(mut resp) = req.into_response(200, Some("OK"), &[("Content-Type", "application/json")]) {
-                    resp.write(json_response.as_bytes())?;
+                    resp.write(b"[")?; // Start JSON array
+
+                    let reader = std::io::BufReader::new(file);
+                    let mut first_entry = true;
+
+                    for line_result in reader.lines() {
+                        match line_result {
+                            Ok(line) if !line.trim().is_empty() => {
+                                // Basic validation: Check if it looks like a JSON object
+                                if line.trim().starts_with('{') && line.trim().ends_with('}') {
+                                    if !first_entry {
+                                        resp.write(b",")?; // Add comma before next entry
+                                    }
+                                    resp.write(line.as_bytes())?;
+                                    first_entry = false;
+                                } else {
+                                    error!("Skipping invalid line in manifest {:?}: {}", manifest_path, line);
+                                }
+                            }
+                            Err(e) => error!("Error reading line from manifest {:?}: {}", manifest_path, e),
+                            _ => {} // Skip empty lines or lines that caused read errors
+                        }
+                    }
+                    resp.write(b"]")?; // End JSON array
                     resp.flush()?;
                     resp.release();
                 }
             }
             Err(e) => {
-                error!("Error loading manifest for metadata request {:?}: {}", full_path, e);
+                error!("Error opening manifest file {:?} for streaming: {}", manifest_path, e);
                 if let Ok(mut resp) = req.into_status_response(500) {
                     resp.write(b"Failed to retrieve directory metadata")?;
                     resp.flush()?;
@@ -699,27 +656,27 @@ fn handle_metadata_request(
         }
     } else {
         // Return metadata for a single file
-        let parent_folder = full_path.parent().ok_or_else(|| anyhow::anyhow!("Invalid file path for metadata: {:?}", full_path))?;
-        let file_name = full_path.file_name().ok_or_else(|| anyhow::anyhow!("Invalid file name for metadata: {:?}", full_path))?.to_string_lossy().to_string();
-
-        match manifest_manager.get_or_load_manifest(parent_folder) {
-            Ok(manifest_arc) => {
-                let manifest = manifest_arc.lock().map_err(|e| anyhow::anyhow!("Failed to lock manifest: {:?}", e))?;
-                if let Some(metadata) = manifest.get_entry(&file_name) {
+        // Use the new stream-based single entry metadata retrieval
+        match manifest_manager.get_entry_metadata(&full_path) {
+            Ok(Some(metadata)) => { // Check if Option<FileMetadata> is Some
+                // Found in manifest
+                info!("Found metadata for {:?} in manifest.", full_path);
                     let json_response = json!(metadata).to_string();
                      if let Ok(mut resp) = req.into_response(200, Some("OK"), &[("Content-Type", "application/json")]) {
                         resp.write(json_response.as_bytes())?;
                         resp.flush()?;
                         resp.release();
                     }
-                } else {
+                } 
+                Ok(None) => { // Not found in manifest
                     // Entry not found in manifest, try to generate it on the fly
                     error!("Metadata not found in manifest for {:?}, attempting to generate.", full_path);
                     match (storage::get_mtime(&full_path), metadata::calculate_crc32(&full_path), fs::metadata(&full_path)) {
-                        (Ok(mtime), Ok(crc32), Ok(metadata)) => {
+                        (Ok(mtime), Ok(crc32), Ok(fs_meta)) => {
+                            let filename = full_path.file_name().ok_or(anyhow::anyhow!("Couldnt get file name"))?;
                             let file_metadata = FileMetadata {
-                                name: file_name.clone(),
-                                size: metadata.len(),
+                                name: filename.to_string_lossy().to_string(),
+                                size: fs_meta.len(),
                                 mtime,
                                 crc32,
                                 is_dir: false,
@@ -744,9 +701,9 @@ fn handle_metadata_request(
                         }
                     }
                 }
-            }
+            
             Err(e) => {
-                error!("Error loading manifest for metadata request {:?}: {}", parent_folder, e);
+                error!("Error reading manifest for metadata request {:?}: {}", full_path, e);
                  if let Ok(mut resp) = req.into_status_response(500) {
                     resp.write(b"Failed to retrieve file metadata")?;
                     resp.flush()?;
@@ -762,13 +719,12 @@ fn handle_metadata_request(
 fn handle_system_request(
     req: Request<&mut EspHttpConnection>,
     wifi_handle: Arc<Mutex<BlockingWifi<esp_idf_svc::wifi::EspWifi<'static>>>>,
-    mount_point: Arc<PathBuf>,
 ) -> Result<(), anyhow::Error> {
     info!("Handling System API request");
 
     let wifi = wifi_handle.lock().map_err(|e| anyhow::anyhow!("Failed to lock wifi handle: {:?}", e))?;
 
-    match system_info::get_system_info(&wifi, &mount_point) {
+    match system_info::get_system_info(&wifi) {
         Ok(info) => {
             let json_response = json!(info).to_string();
              if let Ok(mut resp) = req.into_response(200, Some("OK"), &[("Content-Type", "application/json")]) {
