@@ -38,7 +38,7 @@ pub fn setup_wifi_ap(
 }
 
 pub fn configure_wifi(
-    modem: esp_idf_svc::hal::modem::Modem,
+    modem: esp_idf_svc::hal::modem::WifiModem,
     sys_loop: EspSystemEventLoop,
     nvs: EspDefaultNvsPartition,
 ) -> anyhow::Result<BlockingWifi<EspWifi<'static>>> {

@@ -1,10 +1,10 @@
 use std::{sync::{Arc, Mutex}, thread, time::Duration, path::PathBuf};
 
+use esp32_nimble::BLEDevice;
 use esp_idf_svc::{
-    eventloop::EspSystemEventLoop,
-    log::EspLogger,
-    nvs::EspDefaultNvsPartition,
+     eventloop::EspSystemEventLoop, log::EspLogger, nvs::EspDefaultNvsPartition 
 };
+use log::{error, info};
 use storage::test_sd_speed;
 use wifi::configure_wifi;
 
@@ -12,15 +12,17 @@ mod config;
 mod server;
 mod storage;
 mod wifi;
-mod metadata; // New module
-mod system_info; // New module
+mod metadata;
+mod system_info;
+mod ble_provisioning; // Import the new module
 
 use crate::{
     config::{AppConfig, DEFAULT_ROOT_FOLDER},
     server::setup_http_server,
     storage::setup_sd_card,
     wifi::setup_wifi_ap,
-    metadata::ManifestManager, // Import ManifestManager
+    metadata::ManifestManager,
+    ble_provisioning::BleProvisioningServer, // Import the BLE server struct
 };
 
 fn main() -> anyhow::Result<()> {
@@ -47,10 +49,10 @@ fn main() -> anyhow::Result<()> {
     log::info!("Read speed: {readspeed}, Write speed: {writespeed}");
 
     // Initialize WiFi
-    // TODO: Decide between AP and Station mode based on configuration
-    let wifi = configure_wifi(peripherals.modem, sys_loop.clone(), nvs)?;
+    // TODO: Decide between AP and Station mode based on configuration or BLE input
+    let (wifi,bluetooth) = peripherals.modem.split();
+    let wifi = configure_wifi(wifi, sys_loop.clone(), nvs.clone())?; // Pass nvs to configure_wifi
     log::info!("WiFi configured");
-
 
     // Initialize HTTP server with connection limit
     let server = setup_http_server()?;
@@ -71,55 +73,61 @@ fn main() -> anyhow::Result<()> {
     // Initialize Manifest Manager
     let manifest_manager = Arc::new(ManifestManager::new(root_path.clone()));
 
-    let wifi = Arc::new(Mutex::new(wifi));
+    let wifi_arc = Arc::new(Mutex::new(wifi)); // Wrap wifi in Arc<Mutex>
+
+    
+    let ble_device = BLEDevice::take();
+    let mut ble_server = BleProvisioningServer::new(ble_device, wifi_arc.clone(), root_path.into());
+    ble_server.start()?;
+    log::info!("BLE Provisioning Server initialized");
+
+
     // Store everything in a thread-safe, reference-counted container
     let resources = Arc::new(Mutex::new(server::AppResources {
-        wifi,
+        wifi: wifi_arc.clone(), // Use the cloned wifi Arc
         server,
         mounted_fatfs,
         sys_loop,
         config: app_config,
-        manifest_manager, // Add manifest manager to resources
+        manifest_manager: manifest_manager.clone(), // Use the cloned manifest_manager Arc
     }));
 
     // Setup HTTP handlers
     server::register_handlers(resources.clone())?;
 
     // Leak the resources to ensure they live for the entire program
-    // This is necessary because the HTTP server and WiFi run in the background
+    // This is necessary because the HTTP server, WiFi, and BLE run in the background
     let leaked_resources = Box::leak(Box::new(resources));
+    let leaked_ble_server = Box::leak(Box::new(ble_server)); // Leak the BLE server instance
+
 
     // Keep the program running with periodic status updates
-    log::info!("Server running. Access via http://192.168.4.1"); // TODO: Get actual IP
+    log::info!("Server running. Access via http://192.168.4.1 (or configured IP)"); // TODO: Get actual IP and update via BLE notification
     loop {
-        // Periodically log that we're still running
-        // log::info!("Cloud server active"); // Avoid excessive logging
-
-        // Check WiFi status and reconnect if needed
-        // This part might need adjustment depending on your WiFi mode (AP vs Station)
-        // In AP mode, it's less likely to disconnect spontaneously.
-        // In Station mode, you'd definitely want reconnection logic.
-        // For now, keep the basic check.
-        if let Ok(mut locked_resources) = leaked_resources.lock() {
-             match locked_resources.wifi.lock().map_err(|e| anyhow::anyhow!("Failed to acquire WiFi lock: {:?}", e))?.is_connected() {
-                Ok(connected) => {
-                    if !connected {
-                        log::warn!("WiFi disconnected, attempting to reconnect...");
-                        // Attempt to reconnect - configure_wifi might need to be adapted for reconnection
-                        // For a simple example, we'll just log the state.
-                        // A proper reconnection would involve calling connect() on the wifi instance.
-                        // locked_resources.wifi.connect()?; // Uncomment and handle if needed
+        // Periodically check WiFi status and potentially notify via BLE
+        if let Ok(locked_resources) = leaked_resources.lock() {
+             if let Ok(wifi) = locked_resources.wifi.lock() {
+                 match crate::wifi::get_wifi_status(&wifi) {
+                    Ok((ip, connected)) => {
+                        // You could send a BLE notification here if the status changes
+                        // or periodically if a client is subscribed to the WiFi Status characteristic.
+                        // This requires accessing the ble_server instance from here.
+                        // For now, we'll rely on a client reading the characteristic.
+                         info!("WiFi Status: {}, IP: {}", if connected { "Connected" } else { "Disconnected" }, ip);
+                    },
+                    Err(e) => {
+                        error!("Error checking WiFi status: {}", e);
                     }
-                },
-                Err(e) => {
-                    log::error!("Error checking WiFi status: {}", e);
-                }
-            }
+                 }
+             } else {
+                 error!("Failed to acquire WiFi lock in main loop for status check");
+             }
         } else {
-            log::error!("Failed to acquire resources lock in main loop");
+            error!("Failed to acquire resources lock in main loop for status check");
         }
 
 
-        thread::sleep(Duration::from_secs(60));
+        thread::sleep(Duration::from_secs(10)); // Reduced sleep for more frequent checks
     }
 }
+
